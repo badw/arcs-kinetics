@@ -28,7 +28,7 @@ try:
 except ImportError:
     HAS_NX = False
 
-from species_tracker import SpeciesRecord
+from claude_code.species_tracker import SpeciesRecord
 
 
 @dataclass

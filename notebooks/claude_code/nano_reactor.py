@@ -48,8 +48,8 @@ from ase.md.nptberendsen import NPTBerendsen
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase.io import Trajectory, write
 
-from species_tracker import SpeciesTracker
-from reaction_network import ReactionNetwork
+from claude_code.species_tracker import SpeciesTracker
+from claude_code.reaction_network import ReactionNetwork
 
 
 class NanoReactor:
