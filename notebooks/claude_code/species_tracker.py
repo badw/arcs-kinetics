@@ -510,7 +510,7 @@ class SpeciesTracker:
         total_time_fs = self._frame_count * self.timestep_fs
         fig, ax = plt.subplots(figsize=figsize)
 
-        cmap = plt.cm.get_cmap("tab20", len(sorted_items))
+        cmap = plt.cm.tab20
         for row_idx, (formula, rec) in enumerate(sorted_items):
             color = cmap(row_idx)
             for start_f, end_f, _ in rec.runs:
