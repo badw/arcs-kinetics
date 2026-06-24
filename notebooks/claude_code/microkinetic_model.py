@@ -1,32 +1,47 @@
 """
 microkinetic_model.py
 ---------------------
-Microkinetic rate modelling from NEB barriers.
+Builds and solves a microkinetic model from NEB barriers.
 
-Given a sequence of elementary steps with forward/reverse barriers,
-this module:
+Takes NEBResult objects (from neb_runner.py) and a list of elementary
+steps, then:
 
-  1. Computes Eyring rate constants k(T) for each step
-  2. Builds and integrates the ODE system for species concentrations
-  3. Extracts the overall rate, turnover frequency, and rate-determining step
-  4. Optionally derives the quasi-steady-state (QSS) analytical rate law
-     for simple linear mechanisms
+  1. Converts barriers -> Eyring rate constants k(T)
+  2. Writes the ODE system for all species concentrations
+  3. Integrates to steady state with scipy solve_ivp
+  4. Extracts overall rate, rate-determining step, and species profiles
 
-Physical assumptions
---------------------
-- Gas-phase, ideal mixture: rate = k × [A] × [B] (collision frequency
-  already folded into the pre-exponential via Eyring TST)
-- Reversible elementary steps (both k_f and k_r computed from barriers)
-- Concentration units: molecules per unit volume (normalised to 1 here;
-  pass molar fractions or number densities as initial conditions)
-- Temperature-independent barriers (no quantum tunnelling correction by
-  default; enable Wigner below)
+Designed to slot directly into the nano_reactor pipeline:
 
-Eyring equation
----------------
-    k(T) = (κ kB T / h) × exp(-Ea / kB T)
+    from neb_runner import NEBResult
+    from microkinetic_model import MicroKineticModel, ElementaryStep
 
-where κ is the transmission coefficient (default 1.0).
+    steps = [
+        ElementaryStep(
+            label      = "NO + O2 -> NO3",
+            reactants  = {"NO": 1, "O2": 1},
+            products   = {"NO3": 1},
+            neb_result = neb_results[0],       # NEBResult from neb_runner
+        ),
+        ElementaryStep(
+            label      = "NO3 + NO -> 2NO2",
+            reactants  = {"NO3": 1, "NO": 1},
+            products   = {"NO2": 2},
+            neb_result = neb_results[1],
+        ),
+    ]
+
+    model = MicroKineticModel(
+        steps            = steps,
+        temperature      = 500.0,          # K
+        pressure         = 1.0,            # atm
+        initial_conc     = {"NO": 1.0, "O2": 0.5},   # mol/L
+        target_reaction  = "2NO + O2 -> 2NO2",
+    )
+
+    result = model.run()
+    result.report()
+    result.plot()
 """
 
 from __future__ import annotations
@@ -37,16 +52,138 @@ from typing import Optional
 
 import numpy as np
 from scipy.integrate import solve_ivp
-from scipy.optimize import brentq
+from scipy.optimize import fsolve, root
 
-# Physical constants (SI)
-kB_SI  = 1.380649e-23   # J/K
-h_SI   = 6.62607015e-34 # J·s
-kB_eV  = 8.617333e-5    # eV/K
-NA     = 6.02214076e23  # mol⁻¹
+# Physical constants
+_KB = 8.617333e-5   # eV / K     (Boltzmann)
+_H = 4.135668e-15  # eV · s     (Planck)
+_R = 8.314462e-3   # kJ / mol K (gas constant, for unit notes)
+_EV_TO_KJ = 96.4853  # eV -> kJ/mol
 
-# eV → J
-eV_to_J = 1.602176634e-19
+
+# ---------------------------------------------------------------------------
+# Concentration units
+# ---------------------------------------------------------------------------
+
+class ConcentrationUnit:
+    """
+    Describes what "1.0" means in your initial_conc dict.
+
+    The key quantity is `alpha`: how many mol/L equals one user unit.
+    All internal ODE arithmetic stays in user units; rate constants are
+    rescaled by alpha^(molecularity-1) so the ODE is dimensionally consistent
+    regardless of what unit you choose.
+
+    Built-in constructors
+    ---------------------
+    ConcentrationUnit.mol_per_L()           1.0 = 1 mol/L   (default)
+    ConcentrationUnit.mol_per_m3()          1.0 = 1 mol/m³
+    ConcentrationUnit.ppm(T, P_atm)         1.0 = 1 ppm (ideal gas at T/P)
+    ConcentrationUnit.ppb(T, P_atm)         1.0 = 1 ppb
+    ConcentrationUnit.ppt(T, P_atm)         1.0 = 1 ppt
+    ConcentrationUnit.molecules_per_cm3()   1.0 = 1 molecule/cm³
+    ConcentrationUnit.custom(alpha, label)  1.0 = alpha mol/L
+
+    Parameters
+    ----------
+    alpha : float
+        Number of mol/L equal to one user unit.
+        e.g. for ppm at STP: alpha ≈ 4.46e-8 mol/L
+    label : str
+        Human-readable unit string used in reports and plots.
+    """
+
+    _NA = 6.02214076e23   # mol^-1
+    _R = 8.314462        # J/mol/K
+    _ATM = 101325.0        # Pa per atm
+
+    def __init__(self, alpha: float, label: str = "user units"):
+        if alpha <= 0:
+            raise ValueError(f"alpha must be positive, got {alpha}")
+        self.alpha = float(alpha)   # mol/L per 1 user unit
+        self.label = label
+
+    # ------------------------------------------------------------------
+    # Built-in constructors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def mol_per_L(cls) -> "ConcentrationUnit":
+        """1 user unit = 1 mol/L  (SI chemistry default)."""
+        return cls(1.0, "mol/L")
+
+    @classmethod
+    def mol_per_m3(cls) -> "ConcentrationUnit":
+        """1 user unit = 1 mol/m³."""
+        return cls(1e-3, "mol/m³")
+
+    @classmethod
+    def _ideal_gas_conc_mol_per_L(cls, T: float, P_atm: float) -> float:
+        """Total molar concentration of ideal gas at T (K), P (atm) in mol/L."""
+        P_Pa = P_atm * cls._ATM
+        return (P_Pa / (cls._R * T)) / 1000.0   # mol/m³ -> mol/L
+
+    @classmethod
+    def ppm(cls, T: float = 298.15, P_atm: float = 1.0) -> "ConcentrationUnit":
+        """1 user unit = 1 ppm (mole fraction 1e-6) of ideal gas at T, P."""
+        c_total = cls._ideal_gas_conc_mol_per_L(T, P_atm)
+        return cls(c_total * 1e-6, f"ppm @ {T:.0f}K/{P_atm:.2f}atm")
+
+    @classmethod
+    def ppb(cls, T: float = 298.15, P_atm: float = 1.0) -> "ConcentrationUnit":
+        """1 user unit = 1 ppb (mole fraction 1e-9) of ideal gas at T, P."""
+        c_total = cls._ideal_gas_conc_mol_per_L(T, P_atm)
+        return cls(c_total * 1e-9, f"ppb @ {T:.0f}K/{P_atm:.2f}atm")
+
+    @classmethod
+    def ppt(cls, T: float = 298.15, P_atm: float = 1.0) -> "ConcentrationUnit":
+        """1 user unit = 1 ppt (mole fraction 1e-12) of ideal gas at T, P."""
+        c_total = cls._ideal_gas_conc_mol_per_L(T, P_atm)
+        return cls(c_total * 1e-12, f"ppt @ {T:.0f}K/{P_atm:.2f}atm")
+
+    @classmethod
+    def molecules_per_cm3(cls) -> "ConcentrationUnit":
+        """1 user unit = 1 molecule/cm³  (atmospheric chemistry convention)."""
+        # 1 molecule/cm3 = 1e6 molecule/m3 = 1e6/NA mol/m3 = 1e3/NA mol/L
+        alpha = 1e3 / cls._NA
+        return cls(alpha, "molecule/cm³")
+
+    @classmethod
+    def custom(cls, alpha: float, label: str = "custom") -> "ConcentrationUnit":
+        """1 user unit = alpha mol/L."""
+        return cls(alpha, label)
+
+    # ------------------------------------------------------------------
+    # Conversions
+    # ------------------------------------------------------------------
+
+    def to_mol_per_L(self, value: float) -> float:
+        """Convert a value in user units -> mol/L."""
+        return value * self.alpha
+
+    def from_mol_per_L(self, value: float) -> float:
+        """Convert mol/L -> user units."""
+        return value / self.alpha
+
+    def k_scale(self, molecularity: int) -> float:
+        """
+        Factor to multiply a SI rate constant (mol/L base) by so that
+        rate = k_scaled * [A]_user * [B]_user ...  gives d[X]_user/dt.
+
+        For a step with `molecularity` reactant molecules:
+            k_user = k_SI * alpha^(molecularity - 1)
+        """
+        return self.alpha ** (molecularity - 1)
+
+    def rate_scale(self) -> float:
+        """
+        Factor to convert a rate in mol/L/s to user-units/s.
+        rate_user = rate_SI / alpha
+        """
+        return 1.0 / self.alpha
+
+    def __repr__(self) -> str:
+        return f"ConcentrationUnit(alpha={self.alpha:.4e}, label='{self.label}')"
 
 
 # ---------------------------------------------------------------------------
@@ -56,549 +193,782 @@ eV_to_J = 1.602176634e-19
 @dataclass
 class ElementaryStep:
     """
-    One reversible elementary step in the mechanism.
-
-    reactants  : list of species names on the left  e.g. ['NO', 'O2']
-    products   : list of species names on the right e.g. ['NO3']
-    Ea_f_eV    : forward barrier from NEB (eV)
-    Ea_r_eV    : reverse barrier from NEB (eV)
-    label      : human-readable name
-    kappa      : Eyring transmission coefficient (1 = classical, no tunnelling)
-
-    The reaction energy is implied: ΔE = Ea_f - Ea_r
-    """
-    reactants: list[str]
-    products:  list[str]
-    Ea_f_eV:   float
-    Ea_r_eV:   float
-    label:     str = ""
-    kappa:     float = 1.0
-
-    def k_forward(self, T: float) -> float:
-        """Forward rate constant (s⁻¹ or s⁻¹·[conc]^(n-1)) at temperature T (K)."""
-        return _eyring(self.Ea_f_eV, T, self.kappa)
-
-    def k_reverse(self, T: float) -> float:
-        return _eyring(self.Ea_r_eV, T, self.kappa)
-
-    def delta_E_eV(self) -> float:
-        return self.Ea_f_eV - self.Ea_r_eV
-
-    def equilibrium_constant(self, T: float) -> float:
-        """Dimensionless Keq = kf / kr."""
-        kr = self.k_reverse(T)
-        return self.k_forward(T) / kr if kr > 0 else np.inf
-
-    def summary(self, T: float) -> str:
-        kf = self.k_forward(T)
-        kr = self.k_reverse(T)
-        return (
-            f"  {self.label or '+'.join(self.reactants)+'→'+'+'.join(self.products)}\n"
-            f"    Ea_f = {self.Ea_f_eV:.3f} eV  Ea_r = {self.Ea_r_eV:.3f} eV  "
-            f"ΔE = {self.delta_E_eV():+.3f} eV\n"
-            f"    k_f({T:.0f}K) = {kf:.3e} s⁻¹   k_r = {kr:.3e} s⁻¹   "
-            f"Keq = {kf/kr if kr else np.inf:.3e}"
-        )
-
-
-@dataclass
-class MechanismStep:
-    """Associates an ElementaryStep with its stoichiometric coefficients."""
-    step: ElementaryStep
-    reactant_stoich: dict[str, int]   # e.g. {'NO': 2}
-    product_stoich:  dict[str, int]   # e.g. {'N2O2': 1}
-
-
-@dataclass
-class MicrokineticResult:
-    """All outputs from a microkinetic integration."""
-    T_K: float
-    t_span: tuple[float, float]
-    species: list[str]
-    t: np.ndarray                          # time axis
-    concentrations: np.ndarray            # shape (n_species, n_time)
-    rates: np.ndarray                     # shape (n_steps, n_time)
-    overall_rate: float                   # d[product]/dt at quasi-steady state
-    rate_determining_step: int            # index of rate-limiting step
-    degree_of_rate_control: np.ndarray   # DRC per step
-    converged: bool
-
-    def summary(self, mechanism: list[MechanismStep]) -> str:
-        lines = [f"\nMicrokinetic result at T = {self.T_K:.0f} K"]
-        lines.append(f"  Overall rate = {self.overall_rate:.3e} (conc/s)")
-        rds = mechanism[self.rate_determining_step].step.label or \
-              f"Step {self.rate_determining_step+1}"
-        lines.append(f"  Rate-determining step: {rds} "
-                     f"(DRC = {self.degree_of_rate_control[self.rate_determining_step]:.3f})")
-        lines.append(f"  Degree of rate control per step:")
-        for i, ms in enumerate(mechanism):
-            lbl = ms.step.label or f"Step {i+1}"
-            lines.append(f"    [{i+1}] {lbl}: {self.degree_of_rate_control[i]:.3f}")
-        return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Core physics
-# ---------------------------------------------------------------------------
-
-def _eyring(Ea_eV: float, T: float, kappa: float = 1.0) -> float:
-    """Eyring TST rate constant in s⁻¹ (per-collision units)."""
-    if T <= 0:
-        return 0.0
-    Ea_J = Ea_eV * eV_to_J
-    prefactor = kappa * kB_SI * T / h_SI
-    exponent  = -Ea_J / (kB_SI * T)
-    # Guard against underflow
-    if exponent < -700:
-        return 0.0
-    return prefactor * np.exp(exponent)
-
-
-def _wigner_tunnelling(Ea_eV: float, T: float, nu_imag_cm1: float = 1000.0) -> float:
-    """
-    Wigner tunnelling correction factor (multiplicative on Eyring k).
-    nu_imag_cm1: imaginary frequency of TS in cm⁻¹ (estimate from TS Hessian).
-    Only significant for H-transfer steps at low T.
-    """
-    nu_Hz = nu_imag_cm1 * 2.998e10     # cm⁻¹ → Hz
-    u = h_SI * nu_Hz / (kB_SI * T)
-    return 1.0 + u**2 / 24.0
-
-
-# ---------------------------------------------------------------------------
-# ODE system builder
-# ---------------------------------------------------------------------------
-
-class MicrokineticModel:
-    """
-    Build and integrate the microkinetic ODE for a gas-phase mechanism.
+    One elementary step in the mechanism.
 
     Parameters
     ----------
-    mechanism    : list of MechanismStep objects
-    species      : list of all species names (determines ODE dimension)
-    T_K          : temperature in Kelvin
-    wigner       : apply Wigner tunnelling correction
-    nu_imag_cm1  : imaginary TS frequencies for Wigner (one per step)
+    label     : human-readable name, e.g. "NO + O2 -> NO3"
+    reactants : stoichiometry dict, e.g. {"NO": 1, "O2": 1}
+    products  : stoichiometry dict, e.g. {"NO3": 1}
+    neb_result: NEBResult from neb_runner (provides Ea_forward, Ea_reverse)
+    Ea_forward_eV / Ea_reverse_eV : manual barriers if neb_result is None
+    A_factor  : pre-exponential factor override (s^-1 or L/mol/s);
+                if None, Eyring theory is used: A = kT/h
+    """
+    label:          str
+    reactants:      dict[str, int]
+    products:       dict[str, int]
+    neb_result:     object = None          # NEBResult | None
+    Ea_forward_eV:  Optional[float] = None
+    Ea_reverse_eV:  Optional[float] = None
+    A_factor:       Optional[float] = None
 
-    Example
-    -------
-    steps = [
-        MechanismStep(
-            step=ElementaryStep(['NO','O2'], ['NO3'],
-                                Ea_f_eV=0.5, Ea_r_eV=1.2, label='NO+O2→NO3'),
-            reactant_stoich={'NO':1, 'O2':1},
-            product_stoich={'NO3':1},
-        ),
-        MechanismStep(
-            step=ElementaryStep(['NO3','NO'], ['NO2'],
-                                Ea_f_eV=0.2, Ea_r_eV=0.8, label='NO3+NO→2NO2'),
-            reactant_stoich={'NO3':1, 'NO':1},
-            product_stoich={'NO2':2},
-        ),
-    ]
-    model = MicrokineticModel(steps, species=['NO','O2','NO3','NO2'], T_K=600)
-    result = model.integrate({'NO':1.0, 'O2':0.5}, t_span=(0, 1e-3))
-    print(result.summary(steps))
+    def get_barriers(self) -> tuple[float, float]:
+        """Return (Ea_fwd, Ea_rev) in eV, from neb_result or manual values."""
+        if self.neb_result is not None:
+            return self.neb_result.Ea_forward, self.neb_result.Ea_reverse
+        if self.Ea_forward_eV is not None and self.Ea_reverse_eV is not None:
+            return self.Ea_forward_eV, self.Ea_reverse_eV
+        raise ValueError(
+            f"Step '{self.label}' has no barrier data. "
+            "Provide a neb_result or set Ea_forward_eV / Ea_reverse_eV."
+        )
+
+    def get_delta_E(self) -> float:
+        """Return ΔE in eV (negative = exothermic)."""
+        if self.neb_result is not None:
+            return self.neb_result.delta_E
+        ea_f, ea_r = self.get_barriers()
+        return ea_f - ea_r
+
+    def molecularity(self) -> int:
+        """Total number of reactant molecules (1 = unimolecular, 2 = bimolecular)."""
+        return sum(self.reactants.values())
+
+
+@dataclass
+class MKMResult:
+    """
+    Holds all output from a MicroKineticModel run.
+    """
+    # Setup
+    species:        list[str]
+    step_labels:    list[str]
+    temperature:    float
+    pressure:       float
+    t_span:         tuple[float, float]
+
+    # Eyring rate constants
+    k_forward:      np.ndarray    # shape (n_steps,)
+    k_reverse:      np.ndarray
+
+    # Time evolution
+    t_points:       np.ndarray
+    concentrations: np.ndarray    # shape (n_species, n_timepoints)
+
+    # Steady state
+    ss_concentrations:  dict[str, float]
+    # net rate of each elementary step (mol/L/s)
+    ss_rates:           np.ndarray
+    overall_rate:       float         # mol/L/s, rate of overall reaction
+    target_species:     Optional[str]  # species used to define overall rate
+
+    # Analysis
+    rate_determining_step: str
+    degree_of_rate_control: np.ndarray   # DRC per step
+    equilibrium_constants:  np.ndarray   # Keq = kf/kr per step
+    ode_success:            bool
+    conc_unit:              "ConcentrationUnit"
+
+    def report(self) -> None:
+        """Print a full human-readable summary."""
+        print(f"\n{'='*65}")
+        print(f"MICROKINETIC MODEL REPORT")
+        print(f"{'='*65}")
+        print(f"  T = {self.temperature:.1f} K  |  P = {self.pressure:.3f} atm")
+        print(
+            f"  Integration: {'converged' if self.ode_success else 'DID NOT CONVERGE'}")
+
+        print(f"\n{'─'*65}")
+        print(f"  Rate constants (Eyring, T = {self.temperature:.1f} K)")
+        print(f"  {'Step':<28}  {'kf (s⁻¹ or L/mol/s)':>20}  {'kr':>20}")
+        print(f"  {'─'*64}")
+        for i, lbl in enumerate(self.step_labels):
+            print(
+                f"  {lbl:<28}  {self.k_forward[i]:>20.4e}  {self.k_reverse[i]:>20.4e}")
+
+        print(f"\n{'─'*65}")
+        print(f"  Equilibrium constants  Keq = kf / kr")
+        for i, lbl in enumerate(self.step_labels):
+            print(f"  {lbl:<28}  Keq = {self.equilibrium_constants[i]:.4e}")
+
+        print(f"\n{'─'*65}")
+        print(f"  Steady-state concentrations ({self.conc_unit.label})")
+        for sp, c in sorted(self.ss_concentrations.items()):
+            print(f"  {sp:<16}  {c:.6e}")
+
+        print(f"\n{'─'*65}")
+        print(
+            f"  Net elementary step rates at steady state ({self.conc_unit.label} / s)")
+        for i, lbl in enumerate(self.step_labels):
+            print(f"  {lbl:<28}  {self.ss_rates[i]:>+.4e}")
+
+        print(f"\n{'─'*65}")
+        if self.target_species:
+            print(f"  Overall rate (d[{self.target_species}]/dt at SS) = "
+                  f"{self.overall_rate:.4e} {self.conc_unit.label} / s")
+        print(f"  Rate-determining step: {self.rate_determining_step}")
+
+        print(f"\n{'─'*65}")
+        print(f"  Degree of Rate Control (Campbell DRC)")
+        for i, lbl in enumerate(self.step_labels):
+            print(f"  {lbl:<28}  X_RC = {self.degree_of_rate_control[i]:+.4f}")
+        print(f"{'='*65}\n")
+
+    def plot(
+        self,
+        figsize: tuple = (14, 9),
+        save_path: Optional[str] = None,
+        show: bool = True,
+    ):
+        """
+        Four-panel plot:
+          1. Concentration vs time (all species)
+          2. Net step rates at steady state
+          3. Energy diagram (from Keq and Ea)
+          4. Degree of rate control bar chart
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.gridspec as gridspec
+        except ImportError:
+            raise ImportError("matplotlib required for plot()")
+
+        fig = plt.figure(figsize=figsize)
+        gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.38)
+
+        colors = plt.cm.tab10(np.linspace(0, 1, len(self.species)))
+        sp_color = {sp: colors[i] for i, sp in enumerate(self.species)}
+
+        # ── Panel 1: concentration vs time ──────────────────────────────
+        ax1 = fig.add_subplot(gs[0, 0])
+        for i, sp in enumerate(self.species):
+            ax1.semilogy(self.t_points, self.concentrations[i],
+                         label=sp, color=sp_color[sp], linewidth=1.8)
+        ax1.set_xlabel("Time (s)")
+        ax1.set_ylabel("Concentration (mol / L)")
+        ax1.set_title("Species concentration vs time")
+        ax1.set_xscale("log")
+        ax1.set_yscale("log")
+        ax1.legend(fontsize=8, loc="best")
+        ax1.axvline(self.t_points[-1] * 0.9, color="grey",
+                    lw=0.7, ls="--", label="SS region")
+
+        # ── Panel 2: net step rates at SS ───────────────────────────────
+        ax2 = fig.add_subplot(gs[0, 1])
+        colors2 = ["#2196F3" if r >= 0 else "#F44336" for r in self.ss_rates]
+        ax2.barh(self.step_labels, self.ss_rates, color=colors2, alpha=0.85)
+        ax2.axvline(0, color="black", lw=0.8)
+        ax2.set_xlabel("Net rate (mol / L / s)")
+        ax2.set_title("Elementary step rates at steady state")
+        ax2.tick_params(axis="y", labelsize=8)
+
+        # ── Panel 3: potential energy diagram ───────────────────────────
+        ax3 = fig.add_subplot(gs[1, 0])
+        _plot_energy_diagram(ax3, self.step_labels,
+                             [s.get_barriers()[0] for s in self._steps],
+                             [s.get_barriers()[1] for s in self._steps],
+                             [s.get_delta_E() for s in self._steps])
+        ax3.set_title(
+            f"Potential energy diagram  (T = {self.temperature:.0f} K)")
+
+        # ── Panel 4: degree of rate control ─────────────────────────────
+        ax4 = fig.add_subplot(gs[1, 1])
+        drc_colors = ["#4CAF50" if d > 0 else "#9E9E9E"
+                      for d in self.degree_of_rate_control]
+        ax4.barh(self.step_labels, self.degree_of_rate_control,
+                 color=drc_colors, alpha=0.85)
+        ax4.axvline(0, color="black", lw=0.8)
+        ax4.axvline(1, color="grey",  lw=0.7, ls="--")
+        ax4.set_xlabel("Degree of Rate Control  $X_{RC}$")
+        ax4.set_title("Campbell degree of rate control")
+        ax4.tick_params(axis="y", labelsize=8)
+
+        fig.suptitle(
+            f"Microkinetic model  |  T = {self.temperature:.0f} K  "
+            f"|  P = {self.pressure:.2f} atm",
+            fontsize=12, fontweight="bold",
+        )
+
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Plot saved → {save_path}")
+        if show:
+            plt.show()
+        return fig
+
+    # Internal reference to steps for plotting
+    _steps: list = field(default_factory=list)
+
+
+def _plot_energy_diagram(ax, labels, ea_fwd, ea_rev, delta_e):
+    """Draw a reaction coordinate energy diagram across all steps."""
+    energies = [0.0]
+    ts_energies = []
+    for i in range(len(labels)):
+        ts_energies.append(energies[-1] + ea_fwd[i])
+        energies.append(energies[-1] + delta_e[i])
+
+    # x positions: each step spans 2 units, TS at midpoint
+    x_min = []
+    x_ts = []
+    x_max = []
+    for i in range(len(labels)):
+        x_min.append(i * 2.0)
+        x_ts.append(i * 2.0 + 1.0)
+        x_max.append(i * 2.0 + 2.0)
+
+    x_levels = [0.0] + [x * 2.0 for x in range(1, len(labels) + 1)]
+    y_levels = energies
+
+    # Draw levels as horizontal bars
+    for i, (x, y) in enumerate(zip(x_levels, y_levels)):
+        ax.hlines(y, x - 0.4, x + 0.4, colors="#333", linewidths=2.5)
+
+    # Draw connecting paths through TS
+    for i in range(len(labels)):
+        xpts = [x_levels[i], x_ts[i], x_levels[i + 1]]
+        ypts = [energies[i], ts_energies[i], energies[i + 1]]
+        ax.plot(xpts, ypts, "b--", linewidth=1.2, alpha=0.7)
+        # Annotate TS barrier
+        ax.annotate(
+            f"{ea_fwd[i]:.2f} eV",
+            xy=(x_ts[i], ts_energies[i]),
+            xytext=(x_ts[i] + 0.15, ts_energies[i] + 0.02),
+            fontsize=7, color="#1565C0",
+        )
+
+    ax.set_xticks(x_levels)
+    ax.set_xticklabels(
+        ["R"] + [f"I{i+1}" if i < len(labels) - 1 else "P"
+                 for i in range(len(labels))],
+        fontsize=8,
+    )
+    ax.set_ylabel("Energy (eV)")
+    ax.axhline(0, color="grey", lw=0.5, ls=":")
+
+
+# ---------------------------------------------------------------------------
+# Main model class
+# ---------------------------------------------------------------------------
+
+class MicroKineticModel:
+    """
+    Microkinetic model: ODE integration from Eyring rate constants.
+
+    Parameters
+    ----------
+    steps            : list of ElementaryStep
+    temperature      : temperature in K
+    pressure         : pressure in atm (used for ideal-gas concentration
+                       conversion if needed; doesn't affect rate constants
+                       directly unless you set pressure-dependent A_factor)
+    conc_unit        : ConcentrationUnit describing what "1.0" means in
+                       initial_conc.  Default: mol/L.
+                       e.g. ConcentrationUnit.ppm(T=500, P_atm=1.0)
+                            ConcentrationUnit.molecules_per_cm3()
+                            ConcentrationUnit.custom(alpha=4e-8, label="ppm")
+    initial_conc     : dict mapping species -> initial concentration in the
+                       units described by conc_unit.  Species not listed
+                       default to 0.
+    target_reaction  : overall reaction string e.g. "2NO + O2 -> 2NO2",
+                       used to define which species tracks the overall rate.
+    target_species   : formula of the species whose d[X]/dt gives the overall
+                       rate (e.g. "NO2"). Inferred from target_reaction if None.
+    t_end            : integration end time in seconds (default: auto)
+    n_points         : number of time points to record
+    ss_fraction      : fraction of t_end at which to read steady-state values
+    drc_delta        : fractional barrier perturbation for DRC calculation
+    verbose          : print progress
     """
 
     def __init__(
         self,
-        mechanism: list[MechanismStep],
-        species: list[str],
-        T_K: float,
-        wigner: bool = False,
-        nu_imag_cm1: Optional[list[float]] = None,
+        steps:            list[ElementaryStep],
+        temperature:      float = 500.0,
+        pressure:         float = 1.0,
+        conc_unit:        "ConcentrationUnit | None" = None,
+        initial_conc:     Optional[dict[str, float]] = None,
+        target_reaction:  Optional[str] = None,
+        target_species:   Optional[str] = None,
+        t_end:            Optional[float] = None,
+        n_points:         int = 2000,
+        ss_fraction:      float = 0.85,
+        drc_delta:        float = 0.001,
+        verbose:          bool = True,
     ):
-        self.mechanism   = mechanism
-        self.species     = species
-        self.T_K         = T_K
-        self.wigner      = wigner
-        self.nu_imag_cm1 = nu_imag_cm1 or [1000.0] * len(mechanism)
+        self.steps = steps
+        self.temperature = temperature
+        self.pressure = pressure
+        self.conc_unit = conc_unit if conc_unit is not None else ConcentrationUnit.mol_per_L()
+        self.initial_conc = initial_conc or {}
+        self.target_reaction = target_reaction
+        self.target_species = target_species or self._infer_target()
+        self.t_end = t_end
+        self.n_points = n_points
+        self.ss_fraction = ss_fraction
+        self.drc_delta = drc_delta
+        self.verbose = verbose
 
-        self._idx = {s: i for i, s in enumerate(species)}
-        self._kf, self._kr = self._compute_rate_constants()
+        # Collect all species (preserving order: reactants first, then products)
+        seen = {}
+        for step in steps:
+            for sp in list(step.reactants) + list(step.products):
+                if sp not in seen:
+                    seen[sp] = len(seen)
+        self.species = list(seen)
+        self.species_idx = {sp: i for i, sp in enumerate(self.species)}
+        self.n_species = len(self.species)
+        self.n_steps = len(steps)
 
-    def _compute_rate_constants(self) -> tuple[list[float], list[float]]:
-        kf, kr = [], []
-        for i, ms in enumerate(self.mechanism):
-            kfi = ms.step.k_forward(self.T_K)
-            kri = ms.step.k_reverse(self.T_K)
-            if self.wigner:
-                w = _wigner_tunnelling(ms.step.Ea_f_eV, self.T_K,
-                                       self.nu_imag_cm1[i])
-                kfi *= w
-                kri *= w
-            kf.append(kfi)
-            kr.append(kri)
-        return kf, kr
+    # ------------------------------------------------------------------
+    # Eyring rate constants
+    # ------------------------------------------------------------------
 
-    def _net_rate(self, conc: np.ndarray, step_idx: int) -> float:
-        """Net rate of step i = kf·∏[reactants]^stoich - kr·∏[products]^stoich."""
-        ms = self.mechanism[step_idx]
-        rf = self._kf[step_idx]
-        rr = self._kr[step_idx]
-        for sp, n in ms.reactant_stoich.items():
-            c = max(conc[self._idx[sp]], 0.0)
-            rf *= c ** n
-        for sp, n in ms.product_stoich.items():
-            c = max(conc[self._idx[sp]], 0.0)
-            rr *= c ** n
-        return rf - rr
-
-    def _ode_rhs(self, t: float, conc: np.ndarray) -> np.ndarray:
-        """d[species]/dt from all elementary steps."""
-        dcdt = np.zeros(len(self.species))
-        for i, ms in enumerate(self.mechanism):
-            r = self._net_rate(conc, i)
-            for sp, n in ms.reactant_stoich.items():
-                dcdt[self._idx[sp]] -= n * r
-            for sp, n in ms.product_stoich.items():
-                dcdt[self._idx[sp]] += n * r
-        return dcdt
-
-    def integrate(
-        self,
-        initial_concentrations: dict[str, float],
-        t_span: tuple[float, float] = (0, 1.0),
-        n_points: int = 1000,
-        method: str = "BDF",        # stiff-safe; use 'RK45' for non-stiff
-        rtol: float = 1e-8,
-        atol: float = 1e-12,
-    ) -> MicrokineticResult:
+    def _eyring_k(self, Ea_eV: float) -> float:
         """
-        Integrate the ODE system.
+        k(T) = (kT/h) * exp(-Ea / kT)
+
+        Units: s^-1 for unimolecular, L/mol/s for bimolecular (the kT/h
+        prefactor has units s^-1; for bimolecular steps we don't add a
+        concentration factor here — that's handled by the rate expression
+        in the ODE).  If you have a surface model you'd replace this with
+        the surface Eyring expression.
+        """
+        kT = _KB * self.temperature      # eV
+        prefactor = kT / _H               # s^-1  (~6e12 at 300K)
+        return prefactor * np.exp(-Ea_eV / kT)
+
+    def compute_rate_constants(
+        self,
+        barrier_overrides: Optional[dict[int, tuple[float, float]]] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Compute forward and reverse rate constants for all steps.
 
         Parameters
         ----------
-        initial_concentrations : {species: concentration} — species not listed
-                                 default to 0.
-        t_span  : (t_start, t_end) in seconds
-        n_points: number of output timepoints
-        method  : scipy ODE solver ('BDF' for stiff systems, recommended)
-        """
-        c0 = np.zeros(len(self.species))
-        for sp, val in initial_concentrations.items():
-            if sp in self._idx:
-                c0[self._idx[sp]] = val
+        barrier_overrides : optional dict {step_index: (Ea_fwd, Ea_rev)}
+            used internally for DRC perturbation.
 
-        t_eval = np.linspace(t_span[0], t_span[1], n_points)
+        Returns
+        -------
+        k_fwd, k_rev : arrays of shape (n_steps,)
+        """
+        k_fwd = np.zeros(self.n_steps)
+        k_rev = np.zeros(self.n_steps)
+        overrides = barrier_overrides or {}
+
+        for i, step in enumerate(self.steps):
+            if i in overrides:
+                ea_f, ea_r = overrides[i]
+            else:
+                ea_f, ea_r = step.get_barriers()
+
+            # Rescale so rate constants are consistent with user concentration units.
+            # For a bimolecular step in mol/L: k has units L/mol/s.
+            # If the user works in units U where 1 U = alpha mol/L:
+            #   k_user = k_SI * alpha^(molecularity - 1)
+            # This keeps  rate_user = k_user * [A]_user * [B]_user  correct.
+            mol = step.molecularity()
+            scale_fwd = self.conc_unit.k_scale(mol)
+            # Reverse molecularity = number of product molecules
+            mol_rev = sum(step.products.values())
+            scale_rev = self.conc_unit.k_scale(mol_rev)
+
+            if step.A_factor is not None:
+                k_fwd[i] = step.A_factor * \
+                    np.exp(-ea_f / (_KB * self.temperature)) * scale_fwd
+                k_rev[i] = step.A_factor * \
+                    np.exp(-ea_r / (_KB * self.temperature)) * scale_rev
+            else:
+                k_fwd[i] = self._eyring_k(ea_f) * scale_fwd
+                k_rev[i] = self._eyring_k(ea_r) * scale_rev
+
+        return k_fwd, k_rev
+
+    # ------------------------------------------------------------------
+    # Stoichiometric matrix
+    # ------------------------------------------------------------------
+
+    def _stoich_matrix(self) -> np.ndarray:
+        """
+        nu[i, j] = net stoichiometry of species j in step i.
+        Positive = produced, negative = consumed.
+        Shape: (n_steps, n_species).
+        """
+        nu = np.zeros((self.n_steps, self.n_species))
+        for i, step in enumerate(self.steps):
+            for sp, coeff in step.reactants.items():
+                nu[i, self.species_idx[sp]] -= coeff
+            for sp, coeff in step.products.items():
+                nu[i, self.species_idx[sp]] += coeff
+        return nu
+
+    # ------------------------------------------------------------------
+    # ODE system
+    # ------------------------------------------------------------------
+
+    def _make_ode(
+        self,
+        k_fwd: np.ndarray,
+        k_rev: np.ndarray,
+        nu:    np.ndarray,
+    ):
+        """
+        Return f(t, c) for solve_ivp.
+
+        Rate of step i:
+            r_i = k_fwd[i] * prod(c[j]^nu_ij for reactants)
+                - k_rev[i] * prod(c[j]^nu_ij for products)
+
+        dc[j]/dt = sum_i  nu[i,j] * r_i
+        """
+        n_steps = self.n_steps
+        n_species = self.n_species
+
+        stoich_r = np.where(nu < 0, -nu, 0.0)   # (n_steps, n_species)
+        stoich_p = np.where(nu > 0,  nu, 0.0)
+
+        def f(t, c):
+            c = np.maximum(c, 0.0)
+            c_row = c[np.newaxis, :]              # (1, n_species)
+            rf = k_fwd * np.prod(
+                np.where(stoich_r > 0, c_row ** stoich_r, 1.0), axis=1)
+            rr = k_rev * np.prod(
+                np.where(stoich_p > 0, c_row ** stoich_p, 1.0), axis=1)
+            return nu.T @ (rf - rr)
+
+        return f
+
+    # ------------------------------------------------------------------
+    # Integration
+    # ------------------------------------------------------------------
+
+    def _auto_t_end(self, k_fwd: np.ndarray, k_rev: np.ndarray) -> float:
+        """
+        Estimate a sensible integration time from the slowest rate constant.
+        t_end ~ 100 / k_min  (give slowest step ~100 turnovers to reach SS).
+        """
+        k_all = np.concatenate([k_fwd, k_rev])
+        k_all = k_all[k_all > 0]
+        k_slow = k_all.min() if len(k_all) > 0 else 1.0
+        t_end = min(max(100.0 / k_slow, 1e-10), 1e12)
+        return t_end
+
+    def _integrate(
+        self,
+        k_fwd:   np.ndarray,
+        k_rev:   np.ndarray,
+        nu:      np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, bool]:
+        """
+        Integrate ODEs. Returns (t, c_matrix, success).
+        c_matrix shape: (n_species, n_timepoints).
+        """
+        t_end = self.t_end or self._auto_t_end(k_fwd, k_rev)
+
+        c0 = np.array([
+            self.initial_conc.get(sp, 0.0) for sp in self.species
+        ])
+
+        ode_f = self._make_ode(k_fwd, k_rev, nu)
+
+        t_start_eval = max(t_end * 1e-6, 1e-20)
+        t_end_eval = t_end * (1.0 - 1e-10)
+        if t_start_eval >= t_end_eval:
+            t_start_eval = t_end_eval * 1e-6
+        t_eval = np.logspace(
+            np.log10(t_start_eval),
+            np.log10(t_end_eval),
+            self.n_points,
+        )
 
         sol = solve_ivp(
-            self._ode_rhs, t_span, c0,
-            method=method, t_eval=t_eval,
-            rtol=rtol, atol=atol, dense_output=False,
+            ode_f,
+            t_span=(0.0, float(t_end)),
+            y0=c0,
+            method="LSODA",          # auto-stiff; faster than Radau for plotting
+            t_eval=t_eval,
+            rtol=1e-6,
+            atol=1e-10,
+            dense_output=False,
         )
 
-        converged = sol.success
-        if not converged:
-            warnings.warn(f"ODE integration did not converge: {sol.message}")
+        return sol.t, sol.y, sol.success
 
-        # Per-step net rates at each timepoint
-        rates = np.zeros((len(self.mechanism), len(sol.t)))
-        for ti, conc in enumerate(sol.y.T):
-            for i in range(len(self.mechanism)):
-                rates[i, ti] = self._net_rate(conc, i)
+    # ------------------------------------------------------------------
+    # Steady-state analysis
+    # ------------------------------------------------------------------
 
-        # Overall rate: production rate of the first listed product of last step
-        # (use the quasi-steady-state tail — last 10% of trajectory)
-        last_step  = self.mechanism[-1]
-        first_prod = list(last_step.product_stoich.keys())[0]
-        prod_idx   = self._idx[first_prod]
-        tail_start = int(0.9 * len(sol.t))
-        prod_conc  = sol.y[prod_idx, tail_start:]
-        t_tail     = sol.t[tail_start:]
+    def _solve_ss(
+        self,
+        k_fwd: np.ndarray,
+        k_rev:  np.ndarray,
+        nu:     np.ndarray,
+    ) -> tuple[dict[str, float], bool]:
+        """
+        Solve dc/dt = 0 algebraically for steady-state concentrations.
+        Much faster than integrating to SS with Radau.
 
-        if len(t_tail) > 1:
-            overall_rate = float(np.polyfit(t_tail, prod_conc, 1)[0])
-        else:
-            overall_rate = 0.0
-
-        # Rate-determining step: step with lowest average net rate in QSS tail
-        mean_rates = np.mean(np.abs(rates[:, tail_start:]), axis=1)
-        rds = int(np.argmin(mean_rates))
-
-        # Degree of rate control (Campbell DRC): numerical perturbation
-        drc = self._compute_drc(c0, t_span, overall_rate,
-                                 method, rtol, atol)
-
-        return MicrokineticResult(
-            T_K=self.T_K,
-            t_span=t_span,
-            species=self.species,
-            t=sol.t,
-            concentrations=sol.y,
-            rates=rates,
-            overall_rate=overall_rate,
-            rate_determining_step=rds,
-            degree_of_rate_control=drc,
-            converged=converged,
+        Strategy
+        --------
+        1. Short LSODA pre-run to get into the basin of attraction.
+        2. scipy.optimize.root in log-space (hybr, then krylov).
+        3. Fallback: full Radau integration (slow, last resort only).
+        """
+        ode_f = self._make_ode(k_fwd, k_rev, nu)
+        c0 = np.maximum(
+            np.array([self.initial_conc.get(sp, 0.0) for sp in self.species]),
+            1e-30,
         )
+
+        # Pre-integrate to near-SS. Use the SLOWEST rate constant to set
+        # the timescale — the fastest would be orders of magnitude too short.
+        k_all_ss = np.concatenate([k_fwd, k_rev])
+        k_all_ss = k_all_ss[k_all_ss > 0]
+        k_slow_ss = k_all_ss.min() if len(k_all_ss) else 1.0
+        t_pre = min(max(100.0 / k_slow_ss, 1e-20), 1e10)
+        try:
+            pre = solve_ivp(ode_f, t_span=(0.0, t_pre), y0=c0,
+                            method="LSODA", rtol=1e-6, atol=1e-10)
+            c_guess = np.maximum(pre.y[:, -1], 1e-30) if pre.success else c0
+        except Exception:
+            c_guess = c0
+
+        # Residual in log-space: dc/dt / c = 0
+        def residual(log_c):
+            c = np.exp(np.clip(log_c, -500, 500))
+            return ode_f(0.0, c) / np.maximum(c, 1e-30)
+
+        log_g = np.log(c_guess)
+
+        # Attempt 1: hybr (MINPACK, fast)
+        sol = root(residual, log_g, method="hybr",
+                   options={"maxfev": 2000, "xtol": 1e-10})
+        if sol.success and np.all(np.isfinite(sol.x)):
+            c_ss = np.exp(np.clip(sol.x, -500, 500))
+            return {sp: float(c_ss[i]) for i, sp in enumerate(self.species)}, True
+
+        # Attempt 2: krylov (more robust)
+        sol2 = root(residual, log_g, method="krylov",
+                    options={"maxiter": 500, "fatol": 1e-8})
+        if sol2.success and np.all(np.isfinite(sol2.x)):
+            c_ss = np.exp(np.clip(sol2.x, -500, 500))
+            return {sp: float(c_ss[i]) for i, sp in enumerate(self.species)}, True
+
+        # Attempt 3: full Radau fallback
+        warnings.warn(
+            "Algebraic SS solve failed; falling back to Radau integration.",
+            RuntimeWarning,
+        )
+        t_end = self._auto_t_end(k_fwd, k_rev)
+        fb = solve_ivp(ode_f, t_span=(0.0, float(t_end)), y0=c0,
+                       method="Radau", rtol=1e-8, atol=1e-12)
+        c_end = np.maximum(fb.y[:, -1], 0.0) if fb.success else c0
+        return {sp: float(c_end[i]) for i, sp in enumerate(self.species)}, fb.success
+
+    def _steady_state_rates(
+        self,
+        c_ss: dict[str, float],
+        k_fwd: np.ndarray,
+        k_rev: np.ndarray,
+        nu:    np.ndarray,
+    ) -> np.ndarray:
+        """Net rate of each elementary step at steady state."""
+        c = np.array([c_ss.get(sp, 0.0) for sp in self.species])
+        c = np.maximum(c, 0.0)
+        rates = np.zeros(self.n_steps)
+        for i in range(self.n_steps):
+            rf = k_fwd[i]
+            for j in range(self.n_species):
+                if nu[i, j] < 0:
+                    rf *= c[j] ** (-nu[i, j])
+            rr = k_rev[i]
+            for j in range(self.n_species):
+                if nu[i, j] > 0:
+                    rr *= c[j] ** nu[i, j]
+            rates[i] = rf - rr
+        return rates
+
+    def _overall_rate_from_target(
+        self,
+        c_ss:  dict[str, float],
+        k_fwd: np.ndarray,
+        k_rev: np.ndarray,
+        nu:    np.ndarray,
+    ) -> float:
+        """
+        d[target_species]/dt at steady state.
+        For the overall reaction rate, pick a product (positive contribution).
+        """
+        if self.target_species is None:
+            return 0.0
+        step_rates = self._steady_state_rates(c_ss, k_fwd, k_rev, nu)
+        j = self.species_idx.get(self.target_species)
+        if j is None:
+            return 0.0
+        return float(nu[:, j] @ step_rates)
+
+    # ------------------------------------------------------------------
+    # Campbell Degree of Rate Control
+    # ------------------------------------------------------------------
 
     def _compute_drc(
         self,
-        c0: np.ndarray,
-        t_span: tuple,
-        r_ref: float,
-        method: str,
-        rtol: float,
-        atol: float,
-        delta: float = 0.01,       # 1% perturbation on kf and kr
+        c_ss_ref:   dict[str, float],
+        k_fwd_ref:  np.ndarray,
+        k_rev_ref:  np.ndarray,
+        nu:         np.ndarray,
+        r_ref:      float,
     ) -> np.ndarray:
         """
-        Campbell degree of rate control:
-          DRC_i = (∂ ln r / ∂ ln k_i) at constant Keq
+        Campbell DRC: X_RC,i = (k_i / r) * (dr / dk_i) at constant Keq.
 
-        Numerical approximation: perturb kf_i and kr_i by +δ simultaneously
-        (keeping Keq = kf/kr constant), reintegrate, measure change in rate.
+        Implemented by perturbing Ea_forward by +delta*kT for each step
+        while holding Ea_reverse fixed (so Keq changes negligibly),
+        re-integrating, and computing the numerical derivative.
         """
-        drc = np.zeros(len(self.mechanism))
+        drc = np.zeros(self.n_steps)
+        kT = _KB * self.temperature
+        delta = self.drc_delta
+
         if abs(r_ref) < 1e-30:
             return drc
 
-        for i in range(len(self.mechanism)):
-            # Save original
-            kf_orig = self._kf[i]
-            kr_orig = self._kr[i]
+        for i in range(self.n_steps):
+            ea_f_orig, ea_r_orig = self.steps[i].get_barriers()
+            overrides = {i: (ea_f_orig + delta * kT, ea_r_orig)}
+            k_fwd_p, k_rev_p = self.compute_rate_constants(overrides)
 
-            # Perturb upward (keep Keq constant)
-            self._kf[i] = kf_orig * (1 + delta)
-            self._kr[i] = kr_orig * (1 + delta)
-
-            t_eval = np.linspace(*t_span, 500)
-            sol_p = solve_ivp(self._ode_rhs, t_span, c0,
-                              method=method, t_eval=t_eval,
-                              rtol=rtol, atol=atol)
-
-            # Restore
-            self._kf[i] = kf_orig
-            self._kr[i] = kr_orig
-
-            if not sol_p.success:
-                drc[i] = 0.0
+            # Algebraic SS — no ODE integration, fast
+            c_ss_p, ok_p = self._solve_ss(k_fwd_p, k_rev_p, nu)
+            if not ok_p:
+                warnings.warn(f"DRC solve failed for step {i}")
                 continue
 
-            last_step  = self.mechanism[-1]
-            first_prod = list(last_step.product_stoich.keys())[0]
-            prod_idx   = self._idx[first_prod]
-            tail = int(0.9 * len(t_eval))
-            prod_p = sol_p.y[prod_idx, tail:]
-            t_p    = t_eval[tail:]
-            r_p    = float(np.polyfit(t_p, prod_p, 1)[0]) if len(t_p) > 1 else 0.0
-
-            # DRC ≈ (Δr/r) / (Δk/k) = (r_p - r_ref)/r_ref / delta
-            drc[i] = ((r_p - r_ref) / r_ref) / delta if abs(r_ref) > 0 else 0.0
+            r_pert = self._overall_rate_from_target(
+                c_ss_p, k_fwd_p, k_rev_p, nu)
+            d_ln_k = -delta
+            if abs(d_ln_k) > 0 and abs(r_ref) > 0:
+                drc[i] = ((r_pert - r_ref) / r_ref) / d_ln_k
 
         return drc
 
     # ------------------------------------------------------------------
-    # Analytical QSS rate law (linear mechanisms only)
+    # Main run
     # ------------------------------------------------------------------
 
-    def qss_rate_law(
-        self,
-        intermediate_species: list[str],
-        initial_concentrations: dict[str, float],
-    ) -> str:
+    def run(self) -> MKMResult:
         """
-        Derive a symbolic quasi-steady-state rate expression for simple
-        linear chain mechanisms.  Prints the analytical form and returns
-        it as a string.
-
-        Works for mechanisms where intermediates are consumed as fast as
-        they are made (d[I]/dt ≈ 0).
-
-        For the 2NO+O2 example:
-            QSS on [NO3]: k1f[NO][O2] - k1r[NO3] - k2f[NO3][NO] = 0
-            → [NO3]_ss = k1f[NO][O2] / (k1r + k2f[NO])
-            → r_overall = k2f[NO3]_ss[NO] = k1f·k2f[NO]²[O2] / (k1r + k2f[NO])
+        Run the full microkinetic model and return a MKMResult.
         """
-        kf = self._kf
-        kr = self._kr
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print(f"Microkinetic Model")
+            print(
+                f"  T = {self.temperature:.1f} K  |  P = {self.pressure:.3f} atm")
+            print(f"  Concentration unit: {self.conc_unit.label}  "
+                  f"(1 unit = {self.conc_unit.alpha:.4e} mol/L)")
+            print(f"  {self.n_steps} elementary steps  |  {self.n_species} species")
+            print(f"  Species: {self.species}")
+            print(f"{'='*60}")
 
-        lines = ["Quasi-steady-state rate law (analytical approximation):"]
-        lines.append("")
+        nu = self._stoich_matrix()
 
-        # For the specific 2-step case we can give the exact QSS expression
-        if len(self.mechanism) == 2:
-            ms1 = self.mechanism[0]
-            ms2 = self.mechanism[1]
+        # Rate constants
+        k_fwd, k_rev = self.compute_rate_constants()
 
-            # Step 1: A + B ⇌ I
-            # Step 2: I + C ⇌ products
-            r1_specs = list(ms1.reactant_stoich.keys())
-            r2_specs = list(ms2.reactant_stoich.keys())
+        if self.verbose:
+            kT = _KB * self.temperature
+            print(
+                f"\n  Prefactor kT/h = {kT/_H:.3e} s⁻¹  (T = {self.temperature:.0f} K)")
+            for i, step in enumerate(self.steps):
+                ea_f, ea_r = step.get_barriers()
+                print(f"  {step.label}")
+                print(f"    Ea_fwd = {ea_f:.4f} eV  "
+                      f"kf = {k_fwd[i]:.4e}  "
+                      f"kr = {k_rev[i]:.4e}  "
+                      f"Keq = {k_fwd[i]/max(k_rev[i], 1e-300):.4e}")
 
-            k1f_val = kf[0]
-            k1r_val = kr[0]
-            k2f_val = kf[1]
-            k2r_val = kr[1]
+        # ── Steady-state: fast algebraic solve ────────────────────────
+        if self.verbose:
+            print("\n  Solving steady state (algebraic)...")
+        c_ss, ss_ok = self._solve_ss(k_fwd, k_rev, nu)
+        if not ss_ok:
+            warnings.warn("Steady-state solve did not fully converge.")
+        elif self.verbose:
+            print("  Steady state converged.")
 
-            # Concentrations at t=0
-            c = {sp: initial_concentrations.get(sp, 0.0) for sp in self.species}
+        ss_rates = self._steady_state_rates(c_ss, k_fwd, k_rev, nu)
+        overall_rate = self._overall_rate_from_target(c_ss, k_fwd, k_rev, nu)
 
-            # Symbolic expression
-            lines.append(f"Step 1: {' + '.join(ms1.reactants)} ⇌ {' + '.join(ms1.products)}")
-            lines.append(f"  k1f = {k1f_val:.3e} s⁻¹   k1r = {k1r_val:.3e} s⁻¹")
-            lines.append(f"Step 2: {' + '.join(ms2.reactants)} ⇌ {' + '.join(ms2.products)}")
-            lines.append(f"  k2f = {k2f_val:.3e} s⁻¹   k2r = {k2r_val:.3e} s⁻¹")
-            lines.append("")
+        # ── DRC: N algebraic solves, not N Radau integrations ─────────
+        if self.verbose:
+            print("  Computing degree of rate control (DRC)...")
+        drc = self._compute_drc(c_ss, k_fwd, k_rev, nu, overall_rate)
 
-            # Find the intermediate (product of step 1, reactant of step 2)
-            intermediates = set(ms1.product_stoich) & set(ms2.reactant_stoich)
-            if intermediates:
-                I = list(intermediates)[0]
+        # ── Time evolution: LSODA, only for the plot ───────────────────
+        if self.verbose:
+            t_end_used = self.t_end or self._auto_t_end(k_fwd, k_rev)
+            print(
+                f"  Building time-evolution profile (LSODA, t={t_end_used:.2e} s)...")
+        t_pts, c_mat, success = self._integrate(k_fwd, k_rev, nu)
+        if not success:
+            warnings.warn(
+                "Time-evolution integration did not converge (plot may be rough).")
+        rds_idx = int(np.argmax(np.abs(drc)))
+        rds = self.steps[rds_idx].label
 
-                # QSS: k1f·∏[R1] - k1r·[I] - k2f·[I]·∏[R2_excl_I] = 0
-                r2_excl = [s for s in ms2.reactant_stoich if s != I]
-                r2_prod = np.prod([c[s] ** ms2.reactant_stoich[s]
-                                   for s in r2_excl]) if r2_excl else 1.0
-                r1_prod = np.prod([c[s] ** ms1.reactant_stoich[s]
-                                   for s in ms1.reactants])
+        keq = np.where(k_rev > 0, k_fwd / k_rev, np.inf)
 
-                I_ss_num = k1f_val * r1_prod
-                I_ss_den = k1r_val + k2f_val * r2_prod
-                I_ss     = I_ss_num / I_ss_den if I_ss_den > 0 else 0.0
+        result = MKMResult(
+            species=self.species,
+            step_labels=[s.label for s in self.steps],
+            temperature=self.temperature,
+            pressure=self.pressure,
+            t_span=(float(t_pts[0]), float(t_pts[-1])),
+            k_forward=k_fwd,
+            k_reverse=k_rev,
+            t_points=t_pts,
+            concentrations=c_mat,
+            ss_concentrations=c_ss,
+            ss_rates=ss_rates,
+            overall_rate=overall_rate,
+            target_species=self.target_species,
+            rate_determining_step=rds,
+            degree_of_rate_control=drc,
+            equilibrium_constants=keq,
+            ode_success=success,
+            conc_unit=self.conc_unit,
+        )
+        # Attach steps reference for plotting
+        object.__setattr__(result, '_steps', self.steps)
 
-                r_qss = k2f_val * I_ss * r2_prod
+        if self.verbose:
+            result.report()
 
-                lines.append(f"QSS on [{I}]:")
-                lines.append(f"  [{I}]_ss = k1f·∏[R1] / (k1r + k2f·∏[R2])")
-                lines.append(f"          = {I_ss:.3e}")
-                lines.append("")
-                lines.append(f"Overall rate (QSS):")
-                lines.append(f"  r = k2f · [{I}]_ss · ∏[R2]")
-                lines.append(f"    = k1f·k2f·∏[R1]·∏[R2] / (k1r + k2f·∏[R2])")
-                lines.append(f"    = {r_qss:.3e}  (at initial concentrations)")
-
-                # Rate-limiting regimes
-                if k1r_val > k2f_val * r2_prod:
-                    lines.append("")
-                    lines.append("  Regime: k1r >> k2f·[R2]  →  step 1 pre-equilibrium")
-                    lines.append(f"  r ≈ (k1f/k1r)·k2f·∏[R1]·∏[R2] = Keq1·k2f·∏[all]")
-                else:
-                    lines.append("")
-                    lines.append("  Regime: k2f·[R2] >> k1r  →  step 1 rate-determining")
-                    lines.append(f"  r ≈ k1f·∏[R1]  (step 2 fast, step 1 limits)")
-
-        result = "\n".join(lines)
-        print(result)
         return result
 
     # ------------------------------------------------------------------
-    # Arrhenius fit across temperatures
+    # Helpers
     # ------------------------------------------------------------------
 
-    def arrhenius_fit(
-        self,
-        T_range: tuple[float, float] = (300, 1000),
-        n_T: int = 20,
-        initial_concentrations: dict[str, float] = None,
-        t_span: tuple[float, float] = (0, 1e-3),
-    ) -> dict:
+    def _infer_target(self) -> Optional[str]:
         """
-        Integrate the microkinetic model at multiple temperatures and fit
-        an effective Arrhenius expression to the overall rate:
-            r(T) = A · exp(-Ea_eff / kB T)
-
-        Returns dict with Ea_eff_eV, A, T_values, rates.
+        Guess the target product species from target_reaction string.
+        e.g. "2NO + O2 -> 2NO2"  ->  "NO2"
         """
-        T_values = np.linspace(T_range[0], T_range[1], n_T)
-        rates    = []
-        c0 = initial_concentrations or {}
-
-        for T in T_values:
-            model_T = MicrokineticModel(
-                self.mechanism, self.species, T_K=float(T),
-                wigner=self.wigner,
-            )
-            try:
-                res = model_T.integrate(c0, t_span=t_span, n_points=300)
-                rates.append(max(res.overall_rate, 1e-100))
-            except Exception:
-                rates.append(1e-100)
-
-        rates = np.array(rates)
-        inv_T = 1.0 / T_values
-        ln_r  = np.log(rates)
-        # Linear fit: ln(r) = ln(A) - Ea_eff/(kB·T)
-        coeffs = np.polyfit(inv_T, ln_r, 1)
-        Ea_eff_eV = -coeffs[0] * kB_eV
-        A_prefactor = np.exp(coeffs[1])
-
-        return {
-            "Ea_eff_eV":   Ea_eff_eV,
-            "A_prefactor": A_prefactor,
-            "T_values":    T_values,
-            "rates":       rates,
-        }
-
-
-# ---------------------------------------------------------------------------
-# Convenience builder from NEBResults
-# ---------------------------------------------------------------------------
-
-def mechanism_from_neb_results(
-    neb_results: list,         # list of NEBResult from neb_runner.py
-    step_definitions: list[dict],
-    species: list[str],
-    T_K: float,
-) -> tuple[MicrokineticModel, list[MechanismStep]]:
-    """
-    Build a MicrokineticModel directly from a list of NEBResult objects.
-
-    Parameters
-    ----------
-    neb_results      : list of NEBResult (one per elementary step, in order)
-    step_definitions : list of dicts, each with keys:
-                       'reactants'       : list[str]  — left-hand species
-                       'products'        : list[str]  — right-hand species
-                       'reactant_stoich' : dict[str,int]
-                       'product_stoich'  : dict[str,int]
-                       'label'           : str
-    species          : full list of species names (for ODE dimension)
-    T_K              : temperature in Kelvin
-
-    Example
-    -------
-    neb_results = [result_step1, result_step2]
-    step_defs = [
-        dict(
-            reactants=['NO','O2'], products=['NO3'],
-            reactant_stoich={'NO':1,'O2':1},
-            product_stoich={'NO3':1},
-            label='NO+O2→NO3',
-        ),
-        dict(
-            reactants=['NO3','NO'], products=['NO2'],
-            reactant_stoich={'NO3':1,'NO':1},
-            product_stoich={'NO2':2},
-            label='NO3+NO→2NO2',
-        ),
-    ]
-    model, mechanism = mechanism_from_neb_results(
-        neb_results, step_defs,
-        species=['NO','O2','NO3','NO2'],
-        T_K=600,
-    )
-    """
-    assert len(neb_results) == len(step_definitions), \
-        "Must supply one NEBResult per step definition"
-
-    mechanism = []
-    for neb, defn in zip(neb_results, step_definitions):
-        step = ElementaryStep(
-            reactants = defn["reactants"],
-            products  = defn["products"],
-            Ea_f_eV   = neb.Ea_forward_eV,
-            Ea_r_eV   = neb.Ea_reverse_eV,
-            label     = defn.get("label", ""),
-        )
-        mechanism.append(MechanismStep(
-            step             = step,
-            reactant_stoich  = defn["reactant_stoich"],
-            product_stoich   = defn["product_stoich"],
-        ))
-
-    model = MicrokineticModel(mechanism, species, T_K)
-    return model, mechanism
+        if not self.target_reaction:
+            return None
+        try:
+            _, rhs = self.target_reaction.replace("=", "->").split("->")
+            # Take the last product listed
+            parts = [p.strip() for p in rhs.split("+")]
+            last = parts[-1]
+            # Strip leading stoichiometry number
+            import re
+            m = re.match(r"^\d*\s*([A-Za-z].*)", last)
+            return m.group(1).strip() if m else last
+        except Exception:
+            return None

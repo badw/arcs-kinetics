@@ -80,11 +80,11 @@ def _kabsch_rotate(mobile: np.ndarray, ref: np.ndarray) -> tuple[np.ndarray, np.
     Returns (rotated_mobile, rotation_matrix R) such that mobile @ R.T ~ ref.
     Both inputs must be pre-centred (N,3).
     """
-    H        = mobile.T @ ref
+    H = mobile.T @ ref
     U, _, Vt = np.linalg.svd(H)
-    d        = np.linalg.det(Vt.T @ U.T)
-    D        = np.diag([1.0, 1.0, d])          # fix improper rotation
-    R        = Vt.T @ D @ U.T
+    d = np.linalg.det(Vt.T @ U.T)
+    D = np.diag([1.0, 1.0, d])          # fix improper rotation
+    R = Vt.T @ D @ U.T
     return mobile @ R.T, R
 
 
@@ -93,8 +93,8 @@ def _bonded_pairs(atoms: Atoms, scale: float = 1.3) -> list[tuple[int, int]]:
     Return all bonded pairs (i<j) based on covalent radii * scale.
     """
     syms = atoms.get_chemical_symbols()
-    pos  = atoms.get_positions()
-    n    = len(atoms)
+    pos = atoms.get_positions()
+    n = len(atoms)
     pairs = []
     for i in range(n):
         for j in range(i + 1, n):
@@ -134,7 +134,7 @@ def map_atoms(
 
     pos_r = reactant.get_positions()
     pos_p = product.get_positions()
-    n     = len(reactant)
+    n = len(reactant)
 
     # Centre both
     cr = pos_r.mean(axis=0)
@@ -146,7 +146,7 @@ def map_atoms(
     pp_rot, _ = _kabsch_rotate(pp, pr)
 
     # Build element-masked cost matrix (inf where elements differ)
-    INF  = 1e9
+    INF = 1e9
     cost = np.full((n, n), INF)
     for i in range(n):
         for j in range(n):
@@ -168,11 +168,13 @@ def map_atoms(
         total_disp = sum(
             np.linalg.norm(pr[i] - pp_rot[perm[i]]) for i in range(n)
         )
-        print(f"[map_atoms] Total displacement after mapping: {total_disp:.4f} Å")
+        print(
+            f"[map_atoms] Total displacement after mapping: {total_disp:.4f} Å")
         for i in range(n):
             j = perm[i]
             d = np.linalg.norm(pr[i] - pp_rot[j])
-            print(f"  R[{i}]({syms_r[i]}) -> P[{j}]({syms_p[j]})  disp={d:.3f} Å")
+            print(
+                f"  R[{i}]({syms_r[i]}) -> P[{j}]({syms_p[j]})  disp={d:.3f} Å")
 
     return perm
 
@@ -182,7 +184,7 @@ def reorder_product(product: Atoms, perm: list[int]) -> Atoms:
     Return a copy of `product` with atoms reordered so that atom i
     corresponds to atom i in the reactant (using the mapping from map_atoms).
     """
-    new_pos  = product.get_positions()[perm]
+    new_pos = product.get_positions()[perm]
     new_syms = [product.get_chemical_symbols()[j] for j in perm]
     reordered = product.copy()
     reordered.set_positions(new_pos)
@@ -208,8 +210,8 @@ def _find_bond_changes(
     """
     r_bonds = set(_bonded_pairs(reactant, bond_scale))
     p_bonds = set(_bonded_pairs(product,  bond_scale))
-    formed  = sorted(p_bonds - r_bonds)
-    broken  = sorted(r_bonds - p_bonds)
+    formed = sorted(p_bonds - r_bonds)
+    broken = sorted(r_bonds - p_bonds)
     return formed, broken
 
 
@@ -222,12 +224,12 @@ def _clash_energy(positions: np.ndarray, symbols: list[str]) -> float:
     Soft repulsion energy to measure steric clash.
     E = sum_{i<j} max(0, r0_ij - d_ij)^2 where r0_ij = 0.7*(rcov_i + rcov_j).
     """
-    n   = len(positions)
-    E   = 0.0
+    n = len(positions)
+    E = 0.0
     for i in range(n):
         for j in range(i + 1, n):
-            d     = np.linalg.norm(positions[i] - positions[j])
-            r0    = 0.7 * (_rcov(symbols[i]) + _rcov(symbols[j]))
+            d = np.linalg.norm(positions[i] - positions[j])
+            r0 = 0.7 * (_rcov(symbols[i]) + _rcov(symbols[j]))
             delta = r0 - d
             if delta > 0:
                 E += delta ** 2
@@ -280,9 +282,9 @@ def _place_two_fragments(
 
     # Systematic: rotate B around z-axis in n_orientations steps
     for angle in np.linspace(0, 2 * np.pi, n_orientations, endpoint=False):
-        R_z   = Rotation.from_rotvec(angle * z_vec).as_matrix()
+        R_z = Rotation.from_rotvec(angle * z_vec).as_matrix()
         trial = (b.get_positions() - b_reactive_pos) @ R_z.T + b_reactive_pos
-        combined_pos  = np.vstack([a.get_positions(), trial])
+        combined_pos = np.vstack([a.get_positions(), trial])
         combined_syms = syms_a + syms_b
         clash = _clash_energy(combined_pos, combined_syms)
         if clash < best_clash:
@@ -292,8 +294,9 @@ def _place_two_fragments(
     # Also try random orientations in case the systematic scan missed a minimum
     for _ in range(32):
         R_rand = _random_rotation()
-        trial  = (b.get_positions() - b_reactive_pos) @ R_rand.T + b_reactive_pos
-        combined_pos  = np.vstack([a.get_positions(), trial])
+        trial = (b.get_positions() - b_reactive_pos) @ R_rand.T + \
+            b_reactive_pos
+        combined_pos = np.vstack([a.get_positions(), trial])
         combined_syms = syms_a + syms_b
         clash = _clash_energy(combined_pos, combined_syms)
         if clash < best_clash:
@@ -338,12 +341,12 @@ class ComplexBuilder:
         vacuum: float = 4.0,
         verbose: bool = True,
     ):
-        self.cell_size      = cell_size
+        self.cell_size = cell_size
         self.approach_scale = approach_scale
-        self.bond_scale     = bond_scale
+        self.bond_scale = bond_scale
         self.n_orientations = n_orientations
-        self.vacuum         = vacuum
-        self.verbose        = verbose
+        self.vacuum = vacuum
+        self.verbose = verbose
 
     def _log(self, msg: str) -> None:
         if self.verbose:
@@ -359,7 +362,7 @@ class ComplexBuilder:
         Find the index of the best reactive atom of a given element in a fragment.
         Prefers atoms with fewer bonds (more undercoordinated = more reactive).
         """
-        syms  = frag.get_chemical_symbols()
+        syms = frag.get_chemical_symbols()
         bonds = _bonded_pairs(frag, self.bond_scale)
 
         # Count bonds per atom
@@ -370,7 +373,8 @@ class ComplexBuilder:
 
         candidates = [i for i, s in enumerate(syms) if s == elem]
         if not candidates:
-            raise ValueError(f"Element '{elem}' not found in fragment {frag.get_chemical_formula()}")
+            raise ValueError(
+                f"Element '{elem}' not found in fragment {frag.get_chemical_formula()}")
 
         if prefer_undercoordinated:
             return min(candidates, key=lambda i: bond_count[i])
@@ -410,7 +414,7 @@ class ComplexBuilder:
         """
         # --- 1. Combine all fragments into one Atoms each side ---
         raw_reactant = self._combine_fragments(reactant_fragments, "reactant")
-        raw_product  = self._combine_fragments(product_fragments,  "product")
+        raw_product = self._combine_fragments(product_fragments,  "product")
 
         self._log(f"Reactant: {raw_reactant.get_chemical_formula()}  "
                   f"({len(raw_reactant)} atoms)")
@@ -419,7 +423,7 @@ class ComplexBuilder:
 
         # --- 2. Atom mapping (element-constrained Hungarian) ---
         self._log("Solving atom mapping...")
-        perm            = map_atoms(raw_reactant, raw_product, verbose=atom_map_verbose)
+        perm = map_atoms(raw_reactant, raw_product, verbose=atom_map_verbose)
         matched_product = reorder_product(raw_product, perm)
 
         # --- 3. Identify bond changes ---
@@ -427,14 +431,16 @@ class ComplexBuilder:
             raw_reactant, matched_product, self.bond_scale
         )
         syms_r = raw_reactant.get_chemical_symbols()
-        self._log(f"Bonds formed: {[(syms_r[i],syms_r[j]) for i,j in formed]}")
-        self._log(f"Bonds broken: {[(syms_r[i],syms_r[j]) for i,j in broken]}")
+        self._log(
+            f"Bonds formed: {[(syms_r[i], syms_r[j]) for i, j in formed]}")
+        self._log(
+            f"Bonds broken: {[(syms_r[i], syms_r[j]) for i, j in broken]}")
 
         # --- 4. Build reactive geometry ---
         reactant_complex = self._build_reactant_complex(
             reactant_fragments, forming_bond, breaking_bond, formed, broken, syms_r
         )
-        product_complex  = self._build_product_complex(
+        product_complex = self._build_product_complex(
             product_fragments, raw_reactant, matched_product
         )
 
@@ -445,7 +451,7 @@ class ComplexBuilder:
 
         # --- 6. Put both in a cell centred at box midpoint ---
         reactant_complex = self._place_in_cell(reactant_complex)
-        product_complex  = self._place_in_cell(product_complex)
+        product_complex = self._place_in_cell(product_complex)
 
         self._log("Done.")
         return reactant_complex, product_complex
@@ -489,7 +495,7 @@ class ComplexBuilder:
             frag_a, frag_b = [_center_at_origin(f) for f in fragments]
             syms_a = frag_a.get_chemical_symbols()
             syms_b = frag_b.get_chemical_symbols()
-            n_a    = len(frag_a)
+            n_a = len(frag_a)
 
             # Determine which atoms in each fragment are reactive
             # Priority: (1) user-specified forming_bond hint,
@@ -500,8 +506,8 @@ class ComplexBuilder:
                 forming_bond, breaking_bond, formed, broken, syms_r
             )
 
-            eq_d    = _eq_bond(syms_a[reactive_a], syms_b[reactive_b])
-            app_d   = eq_d * self.approach_scale
+            eq_d = _eq_bond(syms_a[reactive_a], syms_b[reactive_b])
+            app_d = eq_d * self.approach_scale
             self._log(f"  Reactive pair: {syms_a[reactive_a]}(frag_a[{reactive_a}]) "
                       f"-- {syms_b[reactive_b]}(frag_b[{reactive_b}])  "
                       f"target separation = {app_d:.2f} Å")
@@ -525,7 +531,7 @@ class ComplexBuilder:
             elem_hint = forming_bond.elem1 if forming_bond else None
             ri = self._most_exposed(result, elem_hint)
             fi = self._most_exposed(f, elem_hint)
-            eq_d  = _eq_bond(
+            eq_d = _eq_bond(
                 result.get_chemical_symbols()[ri], syms_f[fi]
             )
             placed_r, placed_f = _place_two_fragments(
@@ -571,11 +577,12 @@ class ComplexBuilder:
             return ia, ib
 
         # Option 3: fallback — most undercoordinated heavy atom on each side
-        self._log("  No reactive pair hint found; using most undercoordinated atoms")
+        self._log(
+            "  No reactive pair hint found; using most undercoordinated atoms")
         heavy_a = [i for i, s in enumerate(syms_a) if s != "H"]
         heavy_b = [i for i, s in enumerate(syms_b) if s != "H"]
-        ra      = self._most_exposed(frag_a, None)
-        rb      = self._most_exposed(frag_b, None)
+        ra = self._most_exposed(frag_a, None)
+        rb = self._most_exposed(frag_b, None)
         return ra, rb
 
     def _most_exposed(self, atoms: Atoms, elem: Optional[str]) -> int:
@@ -583,8 +590,8 @@ class ComplexBuilder:
         Return index of atom with fewest bonds (most undercoordinated).
         If elem is given, restricted to that element; else all heavy atoms.
         """
-        syms   = atoms.get_chemical_symbols()
-        bonds  = _bonded_pairs(atoms, self.bond_scale)
+        syms = atoms.get_chemical_symbols()
+        bonds = _bonded_pairs(atoms, self.bond_scale)
         bcount = {i: 0 for i in range(len(atoms))}
         for i, j in bonds:
             bcount[i] += 1
@@ -675,9 +682,9 @@ class ComplexBuilder:
         for step in route:
             r_frags = [species_geometries[f] for f in step["reactants"]]
             p_frags = [species_geometries[f] for f in step["products"]]
-            r_str   = "+".join(step["reactants"])
-            p_str   = "+".join(step["products"])
-            label   = f"{r_str}->{p_str}"
+            r_str = "+".join(step["reactants"])
+            p_str = "+".join(step["products"])
+            label = f"{r_str}->{p_str}"
 
             fb = forming_bonds.get(label)
             self._log(f"\nBuilding: {label}")
@@ -719,8 +726,8 @@ def check_complex_pair(
     """
     syms_r = reactant.get_chemical_symbols()
     syms_p = product.get_chemical_symbols()
-    pos_r  = reactant.get_positions()
-    pos_p  = product.get_positions()
+    pos_r = reactant.get_positions()
+    pos_p = product.get_positions()
 
     results = {}
 
@@ -732,8 +739,8 @@ def check_complex_pair(
 
     # 3. Element ordering
     mismatches = [i for i in range(len(syms_r)) if syms_r[i] != syms_p[i]]
-    results["ordering_ok"]  = len(mismatches) == 0
-    results["mismatches"]   = mismatches
+    results["ordering_ok"] = len(mismatches) == 0
+    results["mismatches"] = mismatches
 
     # 4. Min distance (clash check)
     n = len(reactant)
@@ -744,17 +751,17 @@ def check_complex_pair(
             min_d_r = min(min_d_r, np.linalg.norm(pos_r[i] - pos_r[j]))
             min_d_p = min(min_d_p, np.linalg.norm(pos_p[i] - pos_p[j]))
     results["min_dist_reactant"] = float(min_d_r)
-    results["min_dist_product"]  = float(min_d_p)
-    results["no_clash"]          = min_d_r > 0.5 and min_d_p > 0.5
+    results["min_dist_product"] = float(min_d_p)
+    results["no_clash"] = min_d_r > 0.5 and min_d_p > 0.5
 
     # 5. Max atom displacement
     disps = np.linalg.norm(pos_r - pos_p, axis=1)
-    results["max_displacement"]     = float(disps.max())
-    results["mean_displacement"]    = float(disps.mean())
-    results["displacement_ok"]      = float(disps.max()) < 8.0
+    results["max_displacement"] = float(disps.max())
+    results["mean_displacement"] = float(disps.mean())
+    results["displacement_ok"] = float(disps.max()) < 8.0
 
     if verbose:
-        ok = lambda b: "OK" if b else "FAIL"
+        def ok(b): return "OK" if b else "FAIL"
         print(f"\n[ComplexBuilder] Sanity check:")
         print(f"  Same atom count:       {ok(results['same_count'])}")
         print(f"  Same composition:      {ok(results['same_composition'])}")

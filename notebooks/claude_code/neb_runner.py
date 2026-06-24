@@ -46,6 +46,7 @@ class NEBResult:
     n_images: int
     image_energies: list[float] = field(default_factory=list)  # eV, relative
     converged: bool = True
+    images: list = None
 
     def __str__(self) -> str:
         conv = "converged" if self.converged else "NOT CONVERGED"
@@ -67,6 +68,7 @@ class NEBResult:
             "E_product_eV":   self.E_product,
             "E_ts_eV":        self.E_ts,
             "converged":      self.converged,
+            "images": self.images
         }
 
 
@@ -108,17 +110,17 @@ class NEBRunner:
         interpolation: str = "idpp",
         verbose: bool = True,
     ):
-        self.calc_factory    = calc_factory
-        self.n_images        = n_images
-        self.fmax_relax      = fmax_relax
-        self.fmax_neb        = fmax_neb
+        self.calc_factory = calc_factory
+        self.n_images = n_images
+        self.fmax_relax = fmax_relax
+        self.fmax_neb = fmax_neb
         self.max_steps_relax = max_steps_relax
-        self.max_steps_neb   = max_steps_neb
-        self.spring_k        = spring_k
-        self.climb           = climb
-        self.optimizer       = optimizer
-        self.interpolation   = interpolation
-        self.verbose         = verbose
+        self.max_steps_neb = max_steps_neb
+        self.spring_k = spring_k
+        self.climb = climb
+        self.optimizer = optimizer
+        self.interpolation = interpolation
+        self.verbose = verbose
 
     def _log(self, msg: str) -> None:
         if self.verbose:
@@ -140,7 +142,8 @@ class NEBRunner:
         )
         conv = opt.run(fmax=self.fmax_relax, steps=self.max_steps_relax)
         e = a.get_potential_energy()
-        self._log(f"  {label}: E = {e:.6f} eV  ({'OK' if conv else 'not converged'})")
+        self._log(
+            f"  {label}: E = {e:.6f} eV  ({'OK' if conv else 'not converged'})")
         return a
 
     def run(
@@ -175,23 +178,26 @@ class NEBRunner:
             self._log("Relaxing product...")
             p = self._relax(product,  f"{label}_P", out)
         else:
-            r = reactant.copy(); r.calc = self.calc_factory()
-            p = product.copy();  p.calc = self.calc_factory()
+            r = reactant.copy()
+            r.calc = self.calc_factory()
+            p = product.copy()
+            p.calc = self.calc_factory()
 
         E_r = r.get_potential_energy()
         E_p = p.get_potential_energy()
-        self._log(f"  E_R = {E_r:.6f}  E_P = {E_p:.6f}  dE = {E_p-E_r:+.6f} eV")
+        self._log(
+            f"  E_R = {E_r:.6f}  E_P = {E_p:.6f}  dE = {E_p-E_r:+.6f} eV")
 
         write(str(out / f"{label}_R_relaxed.xyz"), r)
         write(str(out / f"{label}_P_relaxed.xyz"), p)
 
         # 2. Build images
         n_total = self.n_images + 2
-        images  = [r.copy() for _ in range(n_total)]
+        images = [r.copy() for _ in range(n_total)]
         images[-1] = p.copy()
         for img in images[1:-1]:
             img.calc = self.calc_factory()
-        images[0].calc  = r.calc
+        images[0].calc = r.calc
         images[-1].calc = p.calc
 
         neb = NEB(images, k=self.spring_k, climb=False, method="aseneb")
@@ -223,7 +229,7 @@ class NEBRunner:
         E_abs = [img.get_potential_energy() for img in images]
         E_rel = [e - E_r for e in E_abs]
         ts_idx = int(np.argmax(E_abs))
-        E_ts   = E_abs[ts_idx]
+        E_ts = E_abs[ts_idx]
         Ea_fwd = max(0.0, E_ts - E_r)
         Ea_rev = max(0.0, E_ts - E_p)
 
@@ -235,13 +241,14 @@ class NEBRunner:
             fh.write(f"# {label}\n# image  E_rel(eV)\n")
             for i, e in enumerate(E_rel):
                 fh.write(f"  {i:3d}   {e:+.6f}\n")
-            fh.write(f"# Ea_fwd = {Ea_fwd:.4f}  Ea_rev = {Ea_rev:.4f}  dE = {E_p-E_r:+.4f}\n")
+            fh.write(
+                f"# Ea_fwd = {Ea_fwd:.4f}  Ea_rev = {Ea_rev:.4f}  dE = {E_p-E_r:+.4f}\n")
 
         result = NEBResult(
             label=label, Ea_forward=Ea_fwd, Ea_reverse=Ea_rev,
             delta_E=E_p - E_r, E_reactant=E_r, E_product=E_p,
             E_ts=E_ts, ts_image_index=ts_idx, n_images=n_total,
-            image_energies=E_rel, converged=converged,
+            image_energies=E_rel, converged=converged, images=images
         )
         self._log(str(result))
         return result
@@ -267,7 +274,8 @@ class NEBRunner:
                 label=step["label"],
                 reactant=step["reactant"],
                 product=step["product"],
-                output_dir=str(Path(output_base) / step["label"].replace(" ", "_")),
+                output_dir=str(Path(output_base) /
+                               step["label"].replace(" ", "_")),
                 relax_endpoints=step.get("relax", True),
             ))
         return results
@@ -287,15 +295,16 @@ def plot_energy_profiles(
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
 
-    n   = len(results)
+    n = len(results)
     fig = plt.figure(figsize=figsize)
-    gs  = gridspec.GridSpec(1, n, figure=fig, wspace=0.4)
+    gs = gridspec.GridSpec(1, n, figure=fig, wspace=0.4)
     clr = plt.cm.tab10(np.linspace(0, 1, n))
 
     for idx, res in enumerate(results):
         ax = fig.add_subplot(gs[idx])
-        x  = np.arange(len(res.image_energies))
-        ax.plot(x, res.image_energies, "o-", color=clr[idx], linewidth=2, markersize=5)
+        x = np.arange(len(res.image_energies))
+        ax.plot(x, res.image_energies, "o-",
+                color=clr[idx], linewidth=2, markersize=5)
         ax.axhline(0,          color="grey", lw=0.7, ls="--")
         ax.axhline(res.delta_E, color="grey", lw=0.7, ls=":")
         ts_e = res.image_energies[res.ts_image_index]
