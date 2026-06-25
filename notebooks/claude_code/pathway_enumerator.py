@@ -34,11 +34,13 @@ Usage
 
     enumerator = PathwayEnumerator(
         overall_reaction = overall,
-        species_pool     = pool,
-        observed_edges   = observed_edges,   # None = don't filter
-        max_step_mult    = 3,   # max times any one step can repeat
-        max_path_steps   = 4,   # max elementary steps per pathway
-        max_paths        = 20,  # stop after this many found
+        md_summary_df    = reactor.tracker.summary_dataframe(
+                               reactants={"NO", "O2"}, products={"NO2"}
+                           ),
+        observed_edges   = observed_edges,   # None = consider all atom-balanced steps
+        max_step_mult    = 3,
+        max_path_steps   = 4,
+        max_paths        = 20,
     )
 
     pathways = enumerator.enumerate()
@@ -418,6 +420,134 @@ def _find_pathways_ilp(
 # Main enumerator class
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# MD-evidence scoring
+# ---------------------------------------------------------------------------
+
+class MDScorer:
+    """
+    Scores pathways by how well-evidenced their intermediates are in
+    the MD summary dataframe from reactor.tracker.summary_dataframe().
+
+    Species score  (0..1):
+      score(sp) = trajectory_fraction^alpha * norm(max_lifetime_fs)^beta
+
+    where norm(lifetime) = lifetime / max_lifetime_in_dataframe.
+    Alpha and beta control the relative weight of frequency vs stability.
+
+    Species absent from the dataframe (e.g. overall reactants/products
+    that were excluded from the tracker output) get `absent_score`,
+    which defaults to 1.0 so they don't penalise the pathway.
+    Species that were present in the pool but never observed get
+    `unseen_score` (default 0.0 — hard filter).
+
+    Step score     = geometric mean of species scores for its intermediates.
+    Pathway score  = product of step scores * length_penalty^n_steps,
+                     so shorter pathways are preferred all else equal.
+    """
+
+    def __init__(
+        self,
+        df,                          # pandas DataFrame from summary_dataframe()
+        alpha:         float = 0.5,  # weight on trajectory_fraction
+        beta:          float = 0.5,  # weight on normalised max_lifetime
+        absent_score:  float = 1.0,  # score for reactants/products not in df
+        unseen_score:  float = 0.0,  # score for pool species never observed
+        length_penalty: float = 0.9, # multiplied per extra step beyond 1
+    ):
+        self.alpha         = alpha
+        self.beta          = beta
+        self.absent_score  = absent_score
+        self.unseen_score  = unseen_score
+        self.length_penalty = length_penalty
+
+        # Build species -> score lookup from the dataframe
+        self._scores: dict[str, float] = {}
+        if df is not None and len(df) > 0:
+            max_life = df["max_lifetime_fs"].max()
+            if max_life <= 0:
+                max_life = 1.0
+            for _, row in df.iterrows():
+                freq  = float(row["trajectory_fraction"])
+                life  = float(row["max_lifetime_fs"]) / max_life
+                score = (freq ** alpha) * (life ** beta)
+                self._scores[row["formula"]] = float(np.clip(score, 0.0, 1.0))
+
+    def species_score(self, formula: str, in_pool: bool = True) -> float:
+        """
+        Return the MD-evidence score for a species.
+          - In df:       computed score (0..1)
+          - Not in df, not in pool: absent_score (probably a reactant/product)
+          - Not in df, in pool:     unseen_score (intermediate never observed)
+        """
+        if formula in self._scores:
+            return self._scores[formula]
+        if not in_pool:
+            return self.absent_score
+        return self.unseen_score
+
+    def step_score(
+        self,
+        step: "ElementaryStep",
+        overall_reactants: set[str],
+        overall_products:  set[str],
+        species_pool:      list[str],
+    ) -> float:
+        """
+        Score one elementary step as the geometric mean of intermediate
+        species scores (reactants and products that are not overall
+        reactants/products).
+        """
+        intermediates = step.all_species() - overall_reactants - overall_products
+        if not intermediates:
+            # Direct step between overall reactants and products
+            return 1.0
+
+        pool_set = set(species_pool)
+        scores = [
+            self.species_score(sp, in_pool=(sp in pool_set))
+            for sp in intermediates
+        ]
+        # Geometric mean: exp(mean(log(scores)))
+        scores = [max(s, 1e-12) for s in scores]
+        return float(np.exp(np.mean(np.log(scores))))
+
+    def pathway_score(
+        self,
+        pathway: "Pathway",
+        overall_reactants: set[str],
+        overall_products:  set[str],
+        species_pool:      list[str],
+    ) -> float:
+        """
+        Score a full pathway:
+          score = product(step_scores) * length_penalty^(n_steps - 1)
+        """
+        step_scores = [
+            self.step_score(step, overall_reactants, overall_products, species_pool)
+            for step in pathway.steps
+        ]
+        base = float(np.prod(step_scores))
+        penalty = self.length_penalty ** max(0, pathway.total_step_count() - 1)
+        return base * penalty
+
+    def rank_pathways(
+        self,
+        pathways:          list["Pathway"],
+        overall_reactants: set[str],
+        overall_products:  set[str],
+        species_pool:      list[str],
+    ) -> list[tuple["Pathway", float]]:
+        """
+        Return pathways sorted by descending score, as (pathway, score) pairs.
+        """
+        scored = [
+            (pw, self.pathway_score(pw, overall_reactants, overall_products, species_pool))
+            for pw in pathways
+        ]
+        return sorted(scored, key=lambda x: -x[1])
+
+
 class PathwayEnumerator:
     """
     Enumerate all elementary step sequences consistent with an overall reaction.
@@ -425,26 +555,48 @@ class PathwayEnumerator:
     Parameters
     ----------
     overall_reaction : str, e.g. "2NO + O2 = 2NO2"
-    species_pool     : list of all species to consider as intermediates
-                       (should include reactants and products)
+    md_summary_df    : pandas DataFrame from reactor.tracker.summary_dataframe().
+                       The formula column is used as the species pool, and the
+                       trajectory_fraction / max_lifetime_fs columns are used
+                       to rank pathways by MD evidence.
+                       If None, species_pool must be provided explicitly.
+    species_pool     : optional list of additional species to include beyond
+                       those in md_summary_df (e.g. literature intermediates
+                       not observed in MD, or the overall reactants/products
+                       themselves). When md_summary_df is provided, these are
+                       merged in. When md_summary_df is None, this is the
+                       full pool and pathways are ranked by step count only.
     observed_edges   : set of (species_a, species_b) pairs actually seen
                        transitioning in your MD/ReactionNetwork output.
                        If None, all atom-balanced steps are considered.
+    score_alpha      : weight on trajectory_fraction in species scoring (0..1)
+    score_beta       : weight on normalised max_lifetime_fs in species scoring
+    absent_score     : score assigned to overall reactants/products not in df
+                       (default 1.0 — don't penalise pathways for using them)
+    unseen_score     : score assigned to pool species never observed in MD
+                       (default 0.0 — effectively filters them out)
+    length_penalty   : multiplied per step beyond the first (default 0.9),
+                       so shorter pathways rank higher all else equal
     max_step_mult    : maximum times any single elementary step can repeat
-                       within one pathway (default 3)
-    max_path_steps   : maximum total elementary steps in a pathway (default 4)
+    max_path_steps   : maximum total elementary steps per pathway
     max_reactants    : max reactant species per elementary step (default 2)
     max_products     : max product species per elementary step (default 2)
     max_coeff        : max stoichiometric coefficient per species (default 2)
-    max_paths        : maximum number of pathways to return (default 20)
+    max_paths        : maximum number of pathways to return
     verbose          : print progress
     """
 
     def __init__(
         self,
         overall_reaction: str,
-        species_pool:     list[str],
+        md_summary_df     = None,        # DataFrame from tracker.summary_dataframe()
+        species_pool:     Optional[list[str]] = None,   # extra / override pool
         observed_edges:   Optional[set[tuple[str, str]]] = None,
+        score_alpha:      float = 0.5,
+        score_beta:       float = 0.5,
+        absent_score:     float = 1.0,
+        unseen_score:     float = 0.0,
+        length_penalty:   float = 0.9,
         max_step_mult:    int = 3,
         max_path_steps:   int = 4,
         max_reactants:    int = 2,
@@ -454,8 +606,8 @@ class PathwayEnumerator:
         verbose:          bool = True,
     ):
         self.overall_reaction = overall_reaction
-        self.species_pool     = list(dict.fromkeys(species_pool))  # dedup, preserve order
         self.observed_edges   = observed_edges
+        self.md_summary_df    = md_summary_df
         self.max_step_mult    = max_step_mult
         self.max_path_steps   = max_path_steps
         self.max_reactants    = max_reactants
@@ -466,21 +618,38 @@ class PathwayEnumerator:
 
         # Parse overall reaction
         self.overall_reactants, self.overall_products = parse_reaction(overall_reaction)
+        overall_species = list(self.overall_reactants) + list(self.overall_products)
 
-        # Collect elements present
-        all_formulae = list(self.overall_reactants) + list(self.overall_products) + self.species_pool
+        # Build species pool:
+        #   1. formulae from the MD dataframe (the primary source)
+        #   2. extra species passed explicitly
+        #   3. overall reactants and products (always included)
+        pool_set: dict[str, None] = {}   # ordered set via dict
+        if md_summary_df is not None and len(md_summary_df) > 0:
+            for formula in md_summary_df["formula"]:
+                pool_set[formula] = None
+        for sp in (species_pool or []):
+            pool_set[sp] = None
+        for sp in overall_species:
+            pool_set[sp] = None
+        self.species_pool = list(pool_set)
+        self.all_species  = self.species_pool
+
+        # Scorer — uses df for weights, absent/unseen defaults for the rest
+        self._scorer = MDScorer(
+            df             = md_summary_df,
+            alpha          = score_alpha,
+            beta           = score_beta,
+            absent_score   = absent_score,
+            unseen_score   = unseen_score,
+            length_penalty = length_penalty,
+        )
+
+        # Elements present in the system
         elem_set: set[str] = set()
-        for f in all_formulae:
+        for f in self.all_species:
             elem_set |= set(parse_formula(f).keys())
         self.elements = sorted(elem_set)
-
-        # All species (pool + any mentioned in overall reaction not already there)
-        sp_set = set(self.species_pool)
-        for sp in list(self.overall_reactants) + list(self.overall_products):
-            if sp not in sp_set:
-                self.species_pool.append(sp)
-                sp_set.add(sp)
-        self.all_species = self.species_pool
 
         # Build target stoichiometry vector
         self.target = self._build_target()
@@ -509,6 +678,8 @@ class PathwayEnumerator:
             print(f"Pathway Enumerator")
             print(f"  Overall: {self.overall_reaction}")
             print(f"  Pool:    {self.species_pool}")
+            if self.md_summary_df is not None:
+                print(f"  MD df:   {len(self.md_summary_df)} species with trajectory data")
             print(f"  Elements: {self.elements}")
             if self.observed_edges:
                 print(f"  MD edges: {len(self.observed_edges)} observed transitions")
@@ -556,6 +727,23 @@ class PathwayEnumerator:
         if self.verbose:
             print(f"\n  Found {len(pathways)} valid pathways.")
 
+        # Rank by MD evidence if a summary dataframe was provided;
+        # otherwise rank by total step count (shorter first).
+        if self.md_summary_df is not None:
+            ranked = self._scorer.rank_pathways(
+                pathways,
+                set(self.overall_reactants),
+                set(self.overall_products),
+                self.all_species,
+            )
+            pathways = [pw for pw, _ in ranked]
+            self._last_scores = {id(pw): score for pw, score in ranked}
+            if self.verbose:
+                print("  Ranked by MD trajectory evidence.")
+        else:
+            pathways = sorted(pathways, key=lambda p: p.total_step_count())
+            self._last_scores = {}
+
         return pathways
 
     def print_pathways(self, pathways: list[Pathway]) -> None:
@@ -571,10 +759,20 @@ class PathwayEnumerator:
             print("  No valid pathways found.")
             return
 
+        scores = getattr(self, "_last_scores", {})
         for i, pw in enumerate(pathways, 1):
             intermediates = pw.intermediates(overall_r, overall_p)
+            score_str = ""
+            if id(pw) in scores:
+                score_str = f"  MD score: {scores[id(pw)]:.4f}"
+            elif self.md_summary_df is not None:
+                s = self._scorer.pathway_score(
+                    pw, overall_r, overall_p, self.all_species
+                )
+                score_str = f"  MD score: {s:.4f}"
             print(f"\nPathway {i}  ({pw.total_step_count()} elementary steps"
                   + (f", intermediates: {', '.join(sorted(intermediates))}" if intermediates else "")
+                  + score_str
                   + ")")
             print(pw.label())
 

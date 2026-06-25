@@ -28,7 +28,7 @@ try:
 except ImportError:
     HAS_NX = False
 
-from species_tracker import SpeciesRecord
+from claude_code.species_tracker import SpeciesRecord
 
 
 @dataclass
@@ -136,14 +136,16 @@ class ReactionNetwork:
                         continue
                     key = (src, tgt)
                     if key not in self._edges:
-                        self._edges[key] = ReactionEdge(source=src, target=tgt, first_frame=t)
+                        self._edges[key] = ReactionEdge(
+                            source=src, target=tgt, first_frame=t)
                     edge = self._edges[key]
                     edge.count += 1
                     edge.last_frame = t + w
 
         if self.verbose:
             raw = len(self._edges)
-            pruned = sum(1 for e in self._edges.values() if e.count >= self.min_edge_count)
+            pruned = sum(1 for e in self._edges.values()
+                         if e.count >= self.min_edge_count)
             print(f"[ReactionNetwork] {raw} raw transitions → "
                   f"{pruned} after min_count≥{self.min_edge_count} filter")
 
@@ -283,4 +285,5 @@ class ReactionNetwork:
             for src, tgt, count in pairs:
                 fh.write(f"{src}  {tgt}  {count}\n")
         if self.verbose:
-            print(f"[ReactionNetwork] Wrote {len(pairs)} NEB pairs to {output_file}")
+            print(
+                f"[ReactionNetwork] Wrote {len(pairs)} NEB pairs to {output_file}")
