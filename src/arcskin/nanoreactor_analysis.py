@@ -15,13 +15,15 @@ from ase.optimize import BFGS
 
 
 class AnalyseNanoReactor:
-    def __init__(self, reactants: list = None,skip_step:int = 5):
+    def __init__(self, reactants: list = None, skip_step: int = 5):
         warnings.simplefilter("ignore")
         self.trajectory = defaultdict(dict)
         self.unique_structures = defaultdict(lambda: defaultdict(list))
         self.unique_smiles_counter = defaultdict(lambda: defaultdict(list))
-        self.unique_compositions_counter = defaultdict(lambda: defaultdict(list))
-        self.unique_point_group_counter = defaultdict(lambda: defaultdict(list))
+        self.unique_compositions_counter = defaultdict(
+            lambda: defaultdict(list))
+        self.unique_point_group_counter = defaultdict(
+            lambda: defaultdict(list))
         self.skip_step = skip_step
         if reactants:
             self.reactants = reactants
@@ -30,9 +32,11 @@ class AnalyseNanoReactor:
         "reads one trajectory of multiple trajectories in xyz format (or xtb's .trj format )"
         if isinstance(trajectory, list):
             for i, traj in enumerate(trajectory):
-                self.trajectory[i] = read(traj, format="xyz", index=f"::{self.skip_step}")
+                self.trajectory[i] = read(
+                    traj, format="xyz", index=f"::{self.skip_step}")
         elif isinstance(trajectory, str):
-            self.trajectory[0] = read(trajectory, format="xyz", index=f"::{self.skip_step}")
+            self.trajectory[0] = read(
+                trajectory, format="xyz", index=f"::{self.skip_step}")
 
     def relax_atoms(self, atoms: Atoms, fmax=0.2, steps=200):
         mult = 2 if sum(atoms.numbers) % 2 else 1
@@ -69,7 +73,7 @@ class AnalyseNanoReactor:
         """Canonical SMILES for each disconnected fragment."""
         conv = ob.OBConversion()
         conv.SetOutFormat(fmt)
-        return [conv.WriteString(frag).split()[0] for frag in to_obmol(atoms).Separate()]
+        return [conv.WriteString(frag).split()[0] for frag in self.to_obmol(atoms).Separate()]
 
     def symmetrize(self, atoms: Atoms, tolerance: float = 0.3) -> tuple[Atoms, str]:
         """Return a symmetrised copy of a molecule and its point group."""
@@ -81,12 +85,12 @@ class AnalyseNanoReactor:
 
     def analyse_trajectory(self, index: int = 0, tolerance: float = 0.3, tqdm_kws={"disable": False}):
         for i, frame in tqdm(enumerate(self.trajectory[index]), total=len(self.trajectory[index]), **tqdm_kws):
-            atoms_list = seperate_atoms(frame)
+            atoms_list = self.seperate_atoms(frame)
             for at in atoms_list:
                 try:
                     at = self.relax_atoms(at)
                     sym, pg = self.symmetrize(at, tolerance=tolerance)
-                    frags = fragment_smiles(sym)
+                    frags = self.fragment_smiles(sym)
                 except Exception:
                     pass
                 if len(frags) == 1:
