@@ -13,30 +13,34 @@ import shutil
 import subprocess
 
 
+def smiles_to_atoms(smi, seed=42, return_charge=True):
+    """Embed a SMILES string in 3D with ETKDG + MMFF and return (Atoms, charge)."""
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        raise ValueError(f"RDKit could not parse SMILES: {smi!r}")
+    mol = Chem.AddHs(mol)
+    charge = Chem.GetFormalCharge(mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = seed
+    if AllChem.EmbedMolecule(mol, params) != 0:
+        raise RuntimeError(f"Embedding failed for {smi!r}")
+    AllChem.MMFFOptimizeMolecule(mol)
+    atoms = Atoms(
+        symbols=[a.GetSymbol() for a in mol.GetAtoms()],
+        positions=mol.GetConformer().GetPositions(),
+    )
+    atoms.positions -= atoms.get_center_of_mass()
+    if return_charge:
+        return atoms, charge
+    else:
+        return atoms
+
+
 class SMILESPack:
 
     def __init__(self, smiles, **kws):
-        self.kws = kws
         self.smiles = smiles
-
-    def smiles_to_atoms(self, smi, seed=42):
-        """Embed a SMILES string in 3D with ETKDG + MMFF and return (Atoms, charge)."""
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            raise ValueError(f"RDKit could not parse SMILES: {smi!r}")
-        mol = Chem.AddHs(mol)
-        charge = Chem.GetFormalCharge(mol)
-        params = AllChem.ETKDGv3()
-        params.randomSeed = seed
-        if AllChem.EmbedMolecule(mol, params) != 0:
-            raise RuntimeError(f"Embedding failed for {smi!r}")
-        AllChem.MMFFOptimizeMolecule(mol)
-        atoms = Atoms(
-            symbols=[a.GetSymbol() for a in mol.GetAtoms()],
-            positions=mol.GetConformer().GetPositions(),
-        )
-        atoms.positions -= atoms.get_center_of_mass()
-        return atoms, charge
+        self.kws = kws
 
     def _random_rotation(self, rng):
         """Uniformly distributed rotation matrix via a random unit quaternion."""
@@ -71,7 +75,7 @@ class SMILESPack:
 
         templates = []
         for smi in self.smiles:
-            mol, chg = self.smiles_to_atoms(
+            mol, chg = smiles_to_atoms(
                 smi, seed=int(rng.integers(1 << 30)))
             templates.append(
                 (mol, chg, np.linalg.norm(mol.positions, axis=1).max()))
@@ -136,7 +140,7 @@ class SMILESPack:
 
 class XTBNanoReactor:
 
-    def __init__(self, combination: dict, cells: list[Atoms], charges: list[float], temperature: int = 1200, time: float = 10.0, step: float = 0.5):
+    def __init__(self, combination: tuple[str, str], cells: list[Atoms], charges: list[float], temperature: int = 1200, time: float = 10.0, step: float = 0.5):
 
         self.xtb = shutil.which("xtb")
         if self.xtb is None:
@@ -189,7 +193,7 @@ class XTBNanoReactor:
 
     def setup_xtb(self):
         for cell, directory in zip(self.cells, self.directories):
-            print(cell, directory)
+            # print(cell, directory)
             with open(os.path.join(directory, "md.inp"), "w") as f:
                 f.write(self.input_file)
             cell.write(os.path.join(directory, "structure.xyz"))
