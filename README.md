@@ -1,11 +1,11 @@
 <div id="toc">
-<img src="./static/ARCS-Kinetics_Logo.png" width="100" align="left" alt="ARC-Kinetics Logo"> 
+<img src="./static/ARCS-Kinetics_Logo.png" width="200" align="left" alt="ARC-Kinetics Logo"> 
 
 
   <ul style="list-style: none">
     <summary>
       <h2> <pre>ARCS-Kinetics - Automated Reactions for CO<sub>2</sub> Storage </pre> </h2>
-      <h3> (with Kinetics) </h3>
+      <h3> <pre> (with Kinetics) </pre></h3>
     </summary>
   </ul>
 </div>
