@@ -25,7 +25,9 @@ License-File: LICENSE
 Requires-Dist: ase
 Requires-Dist: numpy
 Requires-Dist: rdkit
-Requires-Dist: xtb
+Requires-Dist: openbabel
+Requires-Dist: python-utils
+Requires-Dist: tblite
 Requires-Dist: scipy
 Requires-Dist: pymatgen
 Requires-Dist: tqdm
@@ -38,7 +40,26 @@ Requires-Dist: pytest>=7.4.0; extra == "dev"
 Requires-Dist: pytest-cov>=3.0.0; extra == "dev"
 Dynamic: license-file
 
-# arcs-kinetics
-sandbox for kinetics in ARCS
+<div id="toc">
+<img src="./static/ARCS-Kinetics_Logo.png" width="200" align="left" alt="ARC-Kinetics Logo"> 
 
-current code written by Claude, understanding to come later...
+
+  <ul style="list-style: none">
+    <summary>
+      <h2> <pre>ARCS-Kinetics - Automated Reactions for CO<sub>2</sub> Storage </pre> </h2>
+      <h3> <pre> (with Kinetics) </pre></h3>
+    </summary>
+  </ul>
+</div>
+
+Version 0.1.0
+
+! currently a working sandbox 
+
+### Installation
+
+```
+git clone https://github.com/badw/arcs-kinetics.git
+cd arcs-kinetics
+pip install . 
+```

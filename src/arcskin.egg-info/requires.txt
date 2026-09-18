@@ -1,7 +1,9 @@
 ase
 numpy
 rdkit
-xtb
+openbabel
+python-utils
+tblite
 scipy
 pymatgen
 tqdm

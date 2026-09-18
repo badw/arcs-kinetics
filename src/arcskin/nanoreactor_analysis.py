@@ -1,15 +1,17 @@
+import pandas as pd
 from ase import Atoms
 from ase.io import read
 from openbabel import openbabel as ob
 from monty.serialization import loadfn
 from collections import Counter, defaultdict
 from python_utils import raise_exception
-from tqdm.auto import tqdm
+from tqdm import tqdm
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.symmetry.analyzer import PointGroupAnalyzer, iterative_symmetrize
 import warnings
 from tblite.ase import TBLite
 from ase.optimize import BFGS
+import copy
 
 # uses the same as XTB
 
@@ -37,6 +39,13 @@ class AnalyseNanoReactor:
         elif isinstance(trajectory, str):
             self.trajectory[0] = read(
                 trajectory, format="xyz", index=f"::{self.skip_step}")
+
+    def read_arcskintrajectories(self, data: dict):
+        #  add skip step.
+        del data["combinations"]
+        for i, seed in enumerate(data):
+            self.trajectory[i] = [Atoms.fromdict(
+                at) for at in data[seed][::self.skip_step]]
 
     def relax_atoms(self, atoms: Atoms, fmax=0.2, steps=200):
         mult = 2 if sum(atoms.numbers) % 2 else 1
@@ -124,6 +133,7 @@ class AnalyseNanoReactor:
             self.unique_structures[index]["compositions"] = df["compositions"].values
             self.unique_structures[index]["smiles"] = df["smiles"].values
             self.unique_structures[index]["point_group"] = df["point_group"].values
+
             self.unique_smiles_counter[index] = Counter(
                 self.unique_structures[index]["smiles"])
             self.unique_compositions_counter[index] = Counter(
@@ -137,5 +147,4 @@ class AnalyseNanoReactor:
                 self.analyse_trajectory(
                     index=ii, tolerance=tolerance, tqdm_kws=tqdm_kws)
         else:
-            print("Only one trajectory present, correct usage is AnalyseNanoReactor().analyse_trajectory. Running now...")
             self.analyse_trajectory(tolerance=tolerance, tqdm_kws=tqdm_kws)

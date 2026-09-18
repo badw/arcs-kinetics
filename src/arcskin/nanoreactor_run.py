@@ -1,14 +1,16 @@
 import numpy as np
 import itertools as it
-
 from ase import Atoms
-from ase.io import write
+from ase.io import write, read
 from rdkit import Chem
 from rdkit.Chem import AllChem
 import os
 import subprocess
 import tqdm
 from monty.serialization import dumpfn
+from ase.units import Bohr
+import shutil
+import subprocess
 
 
 class SMILESPack:
@@ -130,3 +132,95 @@ class SMILESPack:
         self.charges = charges
 
         return cells, charges
+
+
+class XTBNanoReactor:
+
+    def __init__(self, combination: dict, cells: list[Atoms], charges: list[float], temperature: int = 1200, time: float = 10.0, step: float = 0.5):
+
+        self.xtb = shutil.which("xtb")
+        if self.xtb is None:
+            raise FileNotFoundError("xtb executable not found in PATH")
+
+        self.cells = cells
+        self.num_cells = len(self.cells)
+        self.charges = charges
+        self.spheres = [self.wall_radius(cell) for cell in cells]
+        self.combination = combination
+        self.input_file = f"""
+    $md
+       temp={temperature}
+       time={time}
+       step={step}
+       dump=5.0
+       nvt=true
+       shake=0
+       restart=false
+    $end
+    $scc
+       temp=3000.0
+    $end
+    $wall
+       potential=logfermi
+       beta=6.0
+       temp=6000.0
+       sphere: {np.max(self.spheres):.2F}, all
+    $end
+    """
+
+    def wall_radius(self, atoms, buffer=2.0):  # buffer in Å
+        com = atoms.get_center_of_mass()
+        rmax = np.linalg.norm(atoms.positions - com, axis=1).max()
+        return (rmax + buffer) / Bohr   # Å → Bohr
+
+    def make_directories(self, location='.', exist_ok=True):
+        '''
+        need to make directories initially 
+        '''
+        self.directories = []
+        self.location = location
+        for i in range(self.num_cells):
+            _dir = os.path.join(location, f"seed_{i}")
+            self.directories.append(_dir)
+            os.makedirs(
+                _dir,
+                exist_ok=exist_ok
+            )
+
+    def setup_xtb(self):
+        for cell, directory in zip(self.cells, self.directories):
+            print(cell, directory)
+            with open(os.path.join(directory, "md.inp"), "w") as f:
+                f.write(self.input_file)
+            cell.write(os.path.join(directory, "structure.xyz"))
+
+    def save_xtb_run(self):
+        self.trajectories["combinations"] = self.combination
+        dumpfn(self.trajectories, os.path.join(self.location,
+               "trajectories.json")) if self.trajectories else None
+
+    def run_xtb(self, **kws):
+        procs = []
+        for directory in self.directories:
+            outfile = open(os.path.join(directory, "xtb.out"), "w")
+            p = subprocess.Popen(
+                [self.xtb, "structure.xyz", "--md", "--input", "md.inp"],
+                cwd=directory, stdout=outfile, stderr=subprocess.STDOUT,
+                env={**os.environ, "OMP_NUM_THREADS": "4"},  # seems to be best
+            )
+            procs.append((p, outfile))
+
+        for p, out in procs:
+            p.wait()
+            out.close()
+
+        self.trajectories = {
+            f"seed_{i}": [x.todict() for x in read(os.path.join(directory, "xtb.trj"), index=":", format="xyz")] for i, directory in enumerate(self.directories)
+        }
+
+        self.save_xtb_run()
+
+    def run(self, location="."):
+        self.make_directories(location=location)
+        self.setup_xtb()
+        self.run_xtb()
