@@ -4,7 +4,8 @@
 
   <ul style="list-style: none">
     <summary>
-      <h2> <pre>ARCS-Kinetics - Automated Reactions for CO<sub>2</sub> Storage with Kinetics</pre> </h2>
+      <h2> <pre>ARCS-Kinetics - Automated Reactions for CO<sub>2</sub> Storage </pre> </h2>
+      <h3> (with Kinetics) </h3>
     </summary>
   </ul>
 </div>
