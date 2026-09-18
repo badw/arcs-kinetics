@@ -1,0 +1,44 @@
+Metadata-Version: 2.4
+Name: arcskin
+Version: 1.5.0
+Summary: ARCS-Kinetics - Automated Reactions for CO2 Storage with Kinetics
+Author-email: "Benjamin A. D. Williamson" <benjamin.williamson@ntnu.no>
+License: MIT
+Project-URL: repository, https://github.com/badw/arcs-kinetics.git
+Project-URL: changelog, https://github.com/badw/arcs-kinetics/tree/main/CHANGELOG.md
+Keywords: Chemistry,Organic Chemistry,Reactions,Materials Science
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Science/Research
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering
+Classifier: Operating System :: Microsoft :: Windows
+Classifier: Operating System :: Unix
+Classifier: Operating System :: MacOS
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: ase
+Requires-Dist: numpy
+Requires-Dist: rdkit
+Requires-Dist: xtb
+Requires-Dist: scipy
+Requires-Dist: pymatgen
+Requires-Dist: tqdm
+Requires-Dist: pandas
+Requires-Dist: monty
+Requires-Dist: pytest
+Requires-Dist: deprecated
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: pytest-cov>=3.0.0; extra == "dev"
+Dynamic: license-file
+
+# arcs-kinetics
+sandbox for kinetics in ARCS
+
+current code written by Claude, understanding to come later...

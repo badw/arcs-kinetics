@@ -1,0 +1,15 @@
+ase
+numpy
+rdkit
+xtb
+scipy
+pymatgen
+tqdm
+pandas
+monty
+pytest
+deprecated
+
+[dev]
+pytest>=7.4.0
+pytest-cov>=3.0.0
