@@ -10,14 +10,16 @@ from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.symmetry.analyzer import PointGroupAnalyzer, iterative_symmetrize
 from arcskin.nanoreactor_run import smiles_to_atoms
 import warnings
-from tblite.ase import TBLite
+# from tblite.ase import TBLite
 from ase.optimize import BFGS
+from aimnet.calculators import AIMNet2ASE
+
 import copy
 # uses the same as XTB
 
 
 class AnalyseNanoReactor:
-    def __init__(self, reactants: tuple[str, str] = (None, None), skip_step: int = 5):
+    def __init__(self, reactants: tuple[str, str] = (None, None), skip_step: int = 5, calculator=None):
         warnings.simplefilter("ignore")
         self.trajectory = defaultdict(dict)
         self.unique_structures = defaultdict(lambda: defaultdict(list))
@@ -26,6 +28,8 @@ class AnalyseNanoReactor:
         #    lambda: defaultdict(list))
         # self.unique_point_group_counter = defaultdict(
         #   lambda: defaultdict(list))
+        #  needs to automatically determine.
+        self.calculator = AIMNet2ASE("aimnet2")
         self.skip_step = skip_step
         if reactants:
             self.reactants = reactants
@@ -42,15 +46,15 @@ class AnalyseNanoReactor:
             (self.get_num_atoms(a) for a in self.reactants), Counter()
         )
 
-    def read_trajectory(self, trajectory: list | str):
+    def read_trajectory(self, trajectory: list | str, format=None):
         "reads one trajectory of multiple trajectories in xyz format (or xtb's .trj format )"
         if isinstance(trajectory, list):
             for i, traj in enumerate(trajectory):
                 self.trajectory[i] = read(
-                    traj, format="xyz", index=f"::{self.skip_step}")
+                    traj, format=format, index=f"::{self.skip_step}")
         elif isinstance(trajectory, str):
             self.trajectory[0] = read(
-                trajectory, format="xyz", index=f"::{self.skip_step}")
+                trajectory, format=format, index=f"::{self.skip_step}")
 
     def read_arcskintrajectories(self, data: dict):
         #  add skip step.
@@ -59,9 +63,12 @@ class AnalyseNanoReactor:
             self.trajectory[i] = [Atoms.fromdict(
                 at) for at in data[seed][::self.skip_step]]
 
-    def relax_atoms(self, atoms: Atoms, fmax=0.1, steps=200):
-        mult = 2 if sum(atoms.numbers) % 2 else 1
-        atoms.calc = TBLite(method="GFN2-xTB", multiplicity=mult, verbosity=0)
+    def relax_atoms(self, atoms: Atoms, fmax=0.05, steps=200):
+        #  use TBLIte xtb
+        # mult = 2 if sum(atoms.numbers) % 2 else 1
+        # atoms.calc = TBLite(method="GFN2-xTB",
+        #                    multiplicity=mult, verbosity=0)
+        atoms.calc = self.calculator
         BFGS(atoms, logfile=None).run(fmax=fmax, steps=200)
         return atoms
 
@@ -104,14 +111,25 @@ class AnalyseNanoReactor:
         pg = PointGroupAnalyzer(sym_mol, tolerance=tolerance).sch_symbol
         return AseAtomsAdaptor.get_atoms(sym_mol), pg
 
-    def analyse_trajectory(self, index: int = 0, tolerance: float = 0.3, tqdm_kws={"disable": False}):
+    def analyse_trajectory(self, index: int = 0, tolerance: float = 0.1, tqdm_kws={"disable": False}):
         for i, frame in tqdm(enumerate(self.trajectory[index]), total=len(self.trajectory[index]), **tqdm_kws):
+            self.relax_atoms(frame, fmax=0.1)  # test relaxing the frame first.
             atoms_list = self.seperate_atoms(frame)
             for at in atoms_list:
                 try:
                     at = self.relax_atoms(at)
                     sym, pg = self.symmetrize(at, tolerance=tolerance)
                     frags = self.fragment_smiles(sym)
+
+                    for frag in frags:
+                        if frag not in self.reactants:
+                            num_atoms_frag = self.get_num_atoms(frag)
+                            sensible = Counter(num_atoms_frag) <= Counter(
+                                self.num_reactant_atoms)
+                            if sensible:
+                                self.unique_structures[index]["smiles"].append(
+                                    frag)
+
                 except Exception:
                     pass
                     # self.unique_structures[index]["snapshot_atoms"].append(at)
@@ -119,12 +137,6 @@ class AnalyseNanoReactor:
                     #    sym)
                     # self.unique_structures[index]["compositions"].append(
                     #    sym.get_chemical_formula())
-                for frag in frags:
-                    if not frag in self.reactants:
-                        num_atoms_frag = self.get_num_atoms(frag)
-                        if num_atoms_frag == self.num_reactant_atoms:
-                            self.unique_structures[index]["smiles"].append(
-                                frag)
 
         self.unique_smiles_counter[index] = Counter(
             self.unique_structures[index]["smiles"]

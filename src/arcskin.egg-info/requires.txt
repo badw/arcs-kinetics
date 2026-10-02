@@ -4,6 +4,8 @@ rdkit
 openbabel
 python-utils
 tblite
+sella
+rdkit
 scipy
 pymatgen
 tqdm

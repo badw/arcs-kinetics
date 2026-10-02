@@ -32,6 +32,8 @@ dependencies = [
         'openbabel',
         'python-utils',
         'tblite',
+        'sella',
+        'rdkit',
         #'xtb',
         'scipy',
         'pymatgen',
