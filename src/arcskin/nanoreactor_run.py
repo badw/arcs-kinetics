@@ -222,6 +222,8 @@ class XTBNanoReactor:
             f"seed_{i}": [x.todict() for x in read(os.path.join(directory, "xtb.trj"), index=":", format="xyz")] for i, directory in enumerate(self.directories)
         }
 
+        self.trajectory_locations = [f"{directory}/xtb.trj" for directory in self.directories]
+
         self.save_xtb_run()
 
     def run(self, location="."):

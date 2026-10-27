@@ -14,6 +14,27 @@ from tblite.ase import TBLite
 from ase.optimize import BFGS
 from aimnet.calculators import AIMNet2ASE
 from monty.serialization import loadfn 
+from rdkit import Chem
+from rdkit import DataStructs
+from rdkit.Chem import AllChem
+
+def calculate_molecular_similarity(smiles1, smiles2):
+    # 1. Parse SMILES strings into RDKit molecule objects
+    mol1 = Chem.MolFromSmiles(smiles1)
+    mol2 = Chem.MolFromSmiles(smiles2)
+    
+    # Handle invalid SMILES strings
+    if mol1 is None or mol2 is None:
+        raise ValueError("One or both SMILES strings are invalid.")
+    
+    # 2. Generate Morgan Fingerprints (Radius 2 is standard for ECFC4 equivalence)
+    fp1 = AllChem.GetMorganFingerprintAsBitVect(mol1, radius=2, nBits=2048)
+    fp2 = AllChem.GetMorganFingerprintAsBitVect(mol2, radius=2, nBits=2048)
+    
+    # 3. Calculate Tanimoto Similarity (returns a float between 0.0 and 1.0)
+    similarity = DataStructs.TanimotoSimilarity(fp1, fp2)
+    
+    return similarity
 
 class AnalyseNanoReactor:
     def __init__(self, reactants: tuple[str, str] = None, skip_step: int = 5, calculator=None):
@@ -121,7 +142,7 @@ class AnalyseNanoReactor:
         pg = PointGroupAnalyzer(sym_mol, tolerance=tolerance).sch_symbol
         return AseAtomsAdaptor.get_atoms(sym_mol), pg
 
-    def analyse_trajectory(self, index: int = 0, tolerance: float = 0.1, fmax=0.1, tqdm_kws={"disable": False}):
+    def analyse_trajectory(self, index: int = 0, tolerance: float = 0.1, fmax=0.05, tqdm_kws={"disable": False}):
         for i, frame in tqdm(enumerate(self.trajectory[index]), total=len(self.trajectory[index]), **tqdm_kws):
             self.relax_atoms(frame, fmax=fmax,calculator = self.calculator)  # test relaxing the frame first.
             atoms_list = self.seperate_atoms(frame)
