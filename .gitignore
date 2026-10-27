@@ -5,4 +5,5 @@
 **/lib
 **/.ruff_cache
 **/.vscode 
+**/data
 build

@@ -3,7 +3,7 @@ numpy
 rdkit
 openbabel
 python-utils
-tblite
+aimnet
 sella
 rdkit
 scipy

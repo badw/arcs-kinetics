@@ -27,7 +27,7 @@ Requires-Dist: numpy
 Requires-Dist: rdkit
 Requires-Dist: openbabel
 Requires-Dist: python-utils
-Requires-Dist: tblite
+Requires-Dist: aimnet
 Requires-Dist: sella
 Requires-Dist: rdkit
 Requires-Dist: scipy
