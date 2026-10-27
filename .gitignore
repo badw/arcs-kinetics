@@ -6,4 +6,5 @@
 **/.ruff_cache
 **/.vscode 
 **/data
+**/example_run
 build
