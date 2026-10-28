@@ -37,7 +37,6 @@ def smiles_to_atoms(smi, seed=42, return_charge=True):
 
 
 class SMILESPack:
-
     def __init__(self, smiles, **kws):
         self.smiles = smiles
         self.kws = kws
@@ -46,27 +45,37 @@ class SMILESPack:
         """Uniformly distributed rotation matrix via a random unit quaternion."""
         q = rng.normal(size=4)
         w, x, y, z = q / np.linalg.norm(q)
-        return np.array([
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),
-             2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ])
+        return np.array(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ]
+        )
 
     def _point_in_ball(self, rng, radius):
         v = rng.normal(size=3)
         return v / np.linalg.norm(v) * radius * rng.random() ** (1 / 3)
 
-    def pack_smiles(self, counts=None, radius=None, min_dist=2.0, contact_dist=4.0,
-                    max_tries=300, seed=None, filename="structure.xyz", write_file=False):
-        """Randomly pack molecules into a connected, non-periodic cluster.    
+    def pack_smiles(
+        self,
+        counts=None,
+        radius=None,
+        min_dist=2.0,
+        contact_dist=4.0,
+        max_tries=300,
+        seed=None,
+        filename="structure.xyz",
+        write_file=False,
+    ):
+        """Randomly pack molecules into a connected, non-periodic cluster.
 
         smiles       : list of SMILES strings
         counts       : copies of each (default: one each)
         radius       : cluster radius in Angstrom (default: estimated from molecule sizes)
         min_dist     : minimum interatomic distance between molecules
         contact_dist : each new molecule must come within this of the existing cluster so
-                       nothing is left floating in vacuum (set None to disable)    
+                       nothing is left floating in vacuum (set None to disable)
 
         Returns (Atoms, total_charge).
         """
@@ -75,14 +84,13 @@ class SMILESPack:
 
         templates = []
         for smi in self.smiles:
-            mol, chg = smiles_to_atoms(
-                smi, seed=int(rng.integers(1 << 30)))
-            templates.append(
-                (mol, chg, np.linalg.norm(mol.positions, axis=1).max()))
+            mol, chg = smiles_to_atoms(smi, seed=int(rng.integers(1 << 30)))
+            templates.append((mol, chg, np.linalg.norm(mol.positions, axis=1).max()))
 
         if radius is None:  # sphere sized for a loose ~35% packing of bounding spheres
-            vol = sum(n * (r + min_dist / 2) ** 3 for (_, _, r),
-                      n in zip(templates, counts))
+            vol = sum(
+                n * (r + min_dist / 2) ** 3 for (_, _, r), n in zip(templates, counts)
+            )
             radius = (vol / 0.35) ** (1 / 3)
 
         system = Atoms()
@@ -92,15 +100,16 @@ class SMILESPack:
             for copy in range(n):
                 for attempt in range(max_tries):
                     pos = template.positions @ self._random_rotation(rng).T
-                    pos = pos + \
-                        self._point_in_ball(rng, max(radius - mol_r, 0.0))
+                    pos = pos + self._point_in_ball(rng, max(radius - mol_r, 0.0))
 
                     if len(system) == 0:
                         break
                     dmin = np.linalg.norm(
                         system.positions[None, :, :] - pos[:, None, :], axis=-1
                     ).min()
-                    if dmin >= min_dist and (contact_dist is None or dmin <= contact_dist):
+                    if dmin >= min_dist and (
+                        contact_dist is None or dmin <= contact_dist
+                    ):
                         break
                     if attempt and attempt % 100 == 0:
                         radius *= 1.1  # too tight, let the cluster breathe
@@ -117,14 +126,17 @@ class SMILESPack:
 
         system.positions -= system.get_center_of_mass()
         if write_file:
-            write(filename, system, format="xyz",
-                  comment=f"random cluster, {len(system)} atoms, charge {charge}")
+            write(
+                filename,
+                system,
+                format="xyz",
+                comment=f"random cluster, {len(system)} atoms, charge {charge}",
+            )
 
         return system, charge
 
     def run_multiple(self, num_cells, **kws):
-        random_seeds = np.random.random_integers(
-            low=1, high=42, size=num_cells)
+        random_seeds = np.random.random_integers(low=1, high=42, size=num_cells)
 
         cells = []
         charges = []
@@ -139,8 +151,15 @@ class SMILESPack:
 
 
 class XTBNanoReactor:
-
-    def __init__(self, combination: tuple[str, str], cells: list[Atoms], charges: list[float], temperature: int = 1200, time: float = 10.0, step: float = 0.5):
+    def __init__(
+        self,
+        combination: tuple[str, str],
+        cells: list[Atoms],
+        charges: list[float],
+        temperature: int = 1200,
+        time: float = 10.0,
+        step: float = 0.5,
+    ):
 
         self.xtb = shutil.which("xtb")
         if self.xtb is None:
@@ -175,21 +194,18 @@ class XTBNanoReactor:
     def wall_radius(self, atoms, buffer=2.0):  # buffer in Å
         com = atoms.get_center_of_mass()
         rmax = np.linalg.norm(atoms.positions - com, axis=1).max()
-        return (rmax + buffer) / Bohr   # Å → Bohr
+        return (rmax + buffer) / Bohr  # Å → Bohr
 
-    def make_directories(self, location='.', exist_ok=True):
-        '''
-        need to make directories initially 
-        '''
+    def make_directories(self, location=".", exist_ok=True):
+        """
+        need to make directories initially
+        """
         self.directories = []
         self.location = location
         for i in range(self.num_cells):
             _dir = os.path.join(location, f"seed_{i}")
             self.directories.append(_dir)
-            os.makedirs(
-                _dir,
-                exist_ok=exist_ok
-            )
+            os.makedirs(_dir, exist_ok=exist_ok)
 
     def setup_xtb(self):
         for cell, directory in zip(self.cells, self.directories):
@@ -200,8 +216,9 @@ class XTBNanoReactor:
 
     def save_xtb_run(self):
         self.trajectories["combinations"] = self.combination
-        dumpfn(self.trajectories, os.path.join(self.location,
-               "trajectories.json")) if self.trajectories else None
+        dumpfn(
+            self.trajectories, os.path.join(self.location, "trajectories.json")
+        ) if self.trajectories else None
 
     def run_xtb(self, **kws):
         procs = []
@@ -209,7 +226,9 @@ class XTBNanoReactor:
             outfile = open(os.path.join(directory, "xtb.out"), "w")
             p = subprocess.Popen(
                 [self.xtb, "structure.xyz", "--md", "--input", "md.inp"],
-                cwd=directory, stdout=outfile, stderr=subprocess.STDOUT,
+                cwd=directory,
+                stdout=outfile,
+                stderr=subprocess.STDOUT,
                 env={**os.environ, "OMP_NUM_THREADS": "4"},  # seems to be best
             )
             procs.append((p, outfile))
@@ -219,10 +238,18 @@ class XTBNanoReactor:
             out.close()
 
         self.trajectories = {
-            f"seed_{i}": [x.todict() for x in read(os.path.join(directory, "xtb.trj"), index=":", format="xyz")] for i, directory in enumerate(self.directories)
+            f"seed_{i}": [
+                x.todict()
+                for x in read(
+                    os.path.join(directory, "xtb.trj"), index=":", format="xyz"
+                )
+            ]
+            for i, directory in enumerate(self.directories)
         }
 
-        self.trajectory_locations = [f"{directory}/xtb.trj" for directory in self.directories]
+        self.trajectory_locations = [
+            f"{directory}/xtb.trj" for directory in self.directories
+        ]
 
         self.save_xtb_run()
 

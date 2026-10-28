@@ -6,6 +6,7 @@ import warnings
 from ase.optimize import BFGS, FIRE
 import numpy as np
 import pandas as pd
+from ase.utils import forcecurve
 
 
 def relax(atoms, calc, fmax=0.05, steps=200, logfile=None):
@@ -102,12 +103,18 @@ def run_all(
             trajectory=trajectory,
             logfile=logfile,
         )
+        if np.max(forcecurve.fit_images(images).path) <= 0.1:
+            # need more checks
+            sane = False
+        else:
+            sane = True
         results[k] = {
             "images": images,
             "E": E,
             "Ea": Ea,
             "dE": dE,
             "overall": v["overall"],
+            "sane": sane,
         }
     results = determine_best(results)
 
