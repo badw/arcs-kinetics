@@ -51,10 +51,10 @@ def run_all(endpoints_dict:dict,calculator=None,n_images=5, fmax=0.1,climb=False
     results = {}
 
     for k,v in endpoints_dict.items():
-        reactants = relax(v[0],calc)
-        products = relax(v[1],calc)
+        reactants = relax(v["reactants"],calc)
+        products = relax(v["products"],calc)
         images, E, Ea, dE = run_neb(reactants, products, calc, n_images=n_images, fmax=fmax ,climb=climb, steps=steps,
                                 trajectory=trajectory, logfile=logfile)
-        results[k] = {"images":images,"E":E,"Ea":Ea,"dE":dE}
+        results[k] = {"images":images,"E":E,"Ea":Ea,"dE":dE,"overall":v["overall"]}
 
     return results 
