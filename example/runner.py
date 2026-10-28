@@ -28,7 +28,7 @@ molecules = {"SO3": "O=S(=O)=O", "H2O": "O"}
 sp = SMILESPack(molecules.values())
 # sp = SMILESPack(["[N]=O","[N]=O"])
 cells, charges = sp.run_multiple(
-    num_runs, counts=[num_molecules, num_molecules], min_dist=min_distances
+    num_runs, counts=[num_molecules, num_molecules], min_dist=min_distance
 )
 
 xnr = XTBNanoReactor(

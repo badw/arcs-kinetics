@@ -67,6 +67,7 @@ def determine_best(results):
             "products_energies": results[i]["overall"]["products_energies"],
             "diff": results[i]["overall"]["diff"],
             "images": results[i]["images"],
+            "sane": results[i]["sane"],
         }
     ranking = pd.DataFrame(new_results).T.sort_values(by=["Ea", "dE"], ascending=True)
     return ranking
@@ -103,11 +104,12 @@ def run_all(
             trajectory=trajectory,
             logfile=logfile,
         )
-        if np.max(forcecurve.fit_images(images).path) <= 0.1:
+        if np.max(forcecurve.fit_images(images).path) <= 1:
             # need more checks
             sane = False
         else:
             sane = True
+
         results[k] = {
             "images": images,
             "E": E,
@@ -116,6 +118,7 @@ def run_all(
             "overall": v["overall"],
             "sane": sane,
         }
+
     results = determine_best(results)
 
     return results
