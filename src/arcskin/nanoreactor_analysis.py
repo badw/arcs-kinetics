@@ -287,10 +287,11 @@ class AnalyseNanoReactor:
 
     def get_possible_paths_dict(self):
         if self.sensible_outcomes:
-            return {
+            possible_paths = {
                 i: {"reactants": self.reactants, "products": prod}
                 for i, prod in enumerate(self.sensible_outcomes)
             }
+            return self.relax_all_paths(possible_paths)
         else:
             return None
 
