@@ -42,7 +42,7 @@ xnr.run(location=directory)
 anr = AnalyseNanoReactor(skip_step=10, reactants=list(molecules.values()))
 
 anr.read_trajectory(xnr.trajectory_locations, format="xyz")
-anr.analyse_trajectories()
+anr.analyse_trajectories(n_cpus=10)
 
 df = pd.DataFrame(anr.unique_smiles_counter).sum(axis=1).sort_values(ascending=False)
 print(df)

@@ -40,6 +40,7 @@ dependencies = [
         'aimnet',
         'scipy',
         'pymatgen',
+        'tqdm-pathos',
         'tqdm',
         'pandas',
         'monty',#==2024.2.26',
