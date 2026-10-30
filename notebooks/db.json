@@ -1,0 +1,1 @@
+{"_default": {"1": {"reactants": ["H2O", "SO3"], "products": ["H2SO4"], "Ea": 1, "dE": -0.1}, "2": {"reactants": ["H2O", "NO2"], "products": ["HNO3", "HNO2"], "Ea": 0.8, "dE": -0.2}}}

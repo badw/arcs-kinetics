@@ -19,10 +19,34 @@ from rdkit import DataStructs
 from rdkit.Chem import AllChem
 import itertools as it
 import numpy as np
+import tqdm_pathos
+import multiprocess as mp
+import warp as wp
+import warnings
+
 
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdFingerprintGenerator
-from rdkit.Chem.rdMolDescriptors import CalcMolFormula
+from rdkit import rdBase
+
+rdBase.DisableLog("rdApp.error")
+rdBase.DisableLog("rdApp.warning")
+_calc = None
+
+
+def _get_calc():
+    global _calc
+    if _calc is None:
+        import warp as wp
+
+        wp.config.quiet = True
+        import torch
+
+        torch.set_num_threads(1)
+        from aimnet.calculators import AIMNet2ASE
+
+        _calc = AIMNet2ASE("aimnet2")
+    return _calc
 
 
 def compare_molecules(
@@ -79,6 +103,8 @@ class AnalyseNanoReactor:
         self.trajectory = defaultdict(dict)
         self.unique_structures = defaultdict(lambda: defaultdict(list))
         self.unique_smiles_counter = defaultdict(lambda: defaultdict(list))
+        wp.config.quiet = True
+        mp.set_start_method("spawn", force=True)
         if not calculator:
             print("calculating with default calculator: aimnet")
             self.calculator = AIMNet2ASE("aimnet2")
@@ -182,9 +208,13 @@ class AnalyseNanoReactor:
 
     def symmetrize(self, atoms: Atoms, tolerance: float = 0.3) -> tuple[Atoms, str]:
         """Return a symmetrised copy of a molecule and its point group."""
-        mol = AseAtomsAdaptor.get_molecule(atoms, charge_spin_check=False)
-        sym_mol = iterative_symmetrize(mol, max_n=10, tolerance=tolerance)["sym_mol"]
-        pg = PointGroupAnalyzer(sym_mol, tolerance=tolerance).sch_symbol
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
+            mol = AseAtomsAdaptor.get_molecule(atoms, charge_spin_check=False)
+            sym_mol = iterative_symmetrize(mol, max_n=10, tolerance=tolerance)[
+                "sym_mol"
+            ]
+            pg = PointGroupAnalyzer(sym_mol, tolerance=tolerance).sch_symbol
         return AseAtomsAdaptor.get_atoms(sym_mol), pg
 
     def analyse_trajectory(
@@ -192,21 +222,24 @@ class AnalyseNanoReactor:
         index: int = 0,
         tolerance: float = 0.1,
         fmax=0.05,
-        tqdm_kws={"disable": False},
+        relax_frame=True,
+        multiprocess=True,
+        tqdm_kws={"disable": True},
     ):
         for i, frame in tqdm(
             enumerate(self.trajectory[index]),
             total=len(self.trajectory[index]),
             **tqdm_kws,
         ):
-            self.relax_atoms(
-                frame, fmax=fmax, calculator=self.calculator
-            )  # test relaxing the frame first.
+            if relax_frame:
+                self.relax_atoms(
+                    frame, fmax=0.1, calculator=self.calculator
+                )  # test relaxing the frame first.
             atoms_list = self.seperate_atoms(frame)
             for at in atoms_list:
                 try:
                     at = self.relax_atoms(at, fmax=fmax, calculator=self.calculator)
-                    sym, pg = self.symmetrize(at, tolerance=tolerance)
+                    sym, _ = self.symmetrize(at, tolerance=tolerance)
                     frags = self.fragment_smiles(sym)
 
                     for frag in frags:
@@ -221,29 +254,89 @@ class AnalyseNanoReactor:
                 except Exception as e:
                     print(e)
                     pass
+        if multiprocess:
+            return Counter(self.unique_structures[index]["smiles"])
+        else:
+            self.unique_smiles_counter[index] = Counter(
+                self.unique_structures[index]["smiles"]
+            )
 
-        self.unique_smiles_counter[index] = Counter(
-            self.unique_structures[index]["smiles"]
-        )
+    def analyse_frame(
+        self,
+        frame,
+        tolerance=0.1,
+        fmax=0.05,
+        relax_frame=True,
+    ):
+        calc = _get_calc()
+        if relax_frame:
+            self.relax_atoms(frame, fmax=0.1, calculator=calc)
+        atoms_list = self.seperate_atoms(frame)
+        sensible_structures = []
+        for at in atoms_list:
+            try:
+                at = self.relax_atoms(at, fmax=fmax, calculator=calc)
+                sym, _ = self.symmetrize(at, tolerance=tolerance)
+                frags = self.fragment_smiles(sym)
 
-    def analyse_trajectories(self, tolerance: float = 0.3, tqdm_kws={"disable": False}):
+                for frag in frags:
+                    if frag not in self.reactants:
+                        num_atoms_frag = self.get_num_atoms(frag)
+                        sensible = Counter(num_atoms_frag) <= Counter(
+                            self.num_reactant_atoms
+                        )
+                        if sensible:
+                            sensible_structures.append(
+                                frag
+                            )  # self.unique_structures[index]["smiles"].append(frag)
+
+            except Exception as e:
+                pass
+        return sensible_structures
+
+    def _analyse_trajectories(
+        self,
+        tolerance: float = 0.3,
+        relax_frame=True,
+        multiprocess=False,
+        tqdm_kws={"disable": False},
+    ):
         if len(self.trajectory) > 1:
             for ii in self.trajectory:
                 self.analyse_trajectory(
-                    index=ii, tolerance=tolerance, tqdm_kws=tqdm_kws
+                    index=ii, tolerance=tolerance, relax_frame=True, tqdm_kws=tqdm_kws
                 )
         else:
             self.analyse_trajectory(tolerance=tolerance, tqdm_kws=tqdm_kws)
 
         self.remove_similars()
 
-    def remove_similars(self):
-        unique_smiles = list(
-            pd.DataFrame(self.unique_smiles_counter)
-            .sum(axis=1)
-            .sort_values(ascending=False)
-            .index
+    def analyse_trajectories(
+        self, tolerance: float = 0.3, n_cpus=4, tqdm_kws={"disable": True}
+    ):
+        frames = list(it.chain(*list(self.trajectory.values())))
+        d = tqdm_pathos.map(
+            self.analyse_frame,
+            frames,
+            tolerance=tolerance,
+            tqdm_kwargs=tqdm_kws,
+            n_cpus=n_cpus,
         )
+        self.unique_smiles_counter = Counter(it.chain(*d))
+        self.remove_similars()
+
+    def remove_similars(self):
+        try:  # from previous format... will deprecate later
+            unique_smiles = list(
+                pd.DataFrame(self.unique_smiles_counter)
+                .sum(axis=1)
+                .sort_values(ascending=False)
+                .index
+            )
+        except Exception:
+            unique_smiles = list(
+                pd.Series(self.unique_smiles_counter).sort_values(ascending=False).index
+            )
         similar = self.find_similar(unique_smiles + self.reactants)
         if similar:
             for sim in similar:
