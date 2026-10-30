@@ -13,20 +13,18 @@ from ase.mep import NEBTools
 from ase.utils import forcecurve
 import collections
 import pandas as pd
-import pickle
+from monty.serialization import dumpfn
 
-
-num_molecules = 10
-num_runs = 5
+num_molecules = 4
+num_runs = 4
 min_distance = 2.2
-nano_reactor_temperature = 3000
+nano_reactor_temperature = 1200
 total_time = 10
-directory = "./nanoreactor_run/"
+directory = "./so3_h2o/"
 
 molecules = {"SO3": "O=S(=O)=O", "H2O": "O"}
 
 sp = SMILESPack(molecules.values())
-# sp = SMILESPack(["[N]=O","[N]=O"])
 cells, charges = sp.run_multiple(
     num_runs, counts=[num_molecules, num_molecules], min_dist=min_distance
 )
@@ -61,9 +59,7 @@ if possible_paths:
     reaction_endpoints = {}
     for k, v in possible_paths.items():
         try:
-            reactants, products = make_endpoints(
-                v["reactants"], v["products"], shift=1.5
-            )
+            reactants, products = make_endpoints(v["reactants"], v["products"])
             reaction_endpoints[k] = {
                 "reactants": reactants,
                 "products": products,
@@ -73,9 +69,8 @@ if possible_paths:
             print(f"{k} failed")
             pass
 
-    results = run_all(reaction_endpoints, n_images=8, fmax=0.05)
+    results = run_all(reaction_endpoints, n_images=16, climb=True, fmax=0.05)
 
     print(results)
 
-    with open("neboutput.p", "wb") as f:
-        pickle.dump(results, f)
+    dumpfn(results, f"{directory}results.json", indent=2)
