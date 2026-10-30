@@ -10,9 +10,11 @@ Approach (borrowed from autodE, reimplemented so autodE isn't needed):
      mapped atoms in the template, so its orientation already matches the end
      state and the interpolation doesn't drag atoms through each other.
   3. Rigid-body fit (cf. autode's translate_rotate_reactant / attack_cost):
-     molecules are rotated/translated so bonds that change sit at
-     shift_factor * (r_cov_i + r_cov_j) and no other inter-molecular pair is
-     closer than that.
+     molecules are rotated/translated so bonds that change sit at a contact
+     distance d_ij and no other inter-molecular pair is closer than that.
+     d_ij is either
+       shift="vdw"  : vdw_scale * (r_vdw_i + r_vdw_j)          (default)
+       shift=<float>: shift * (r_cov_i + r_cov_j)               (old behaviour)
 """
 
 import itertools
@@ -30,6 +32,8 @@ from scipy.spatial.transform import Rotation
 from ase import Atoms
 from ase.build import minimize_rotation_and_translation
 from ase.data import covalent_radii
+from ase.data.vdw import vdw_radii as _vdw_bondi
+from ase.data.vdw_alvarez import vdw_radii as _vdw_alvarez
 from ase.optimize import BFGS, FIRE
 
 RDLogger.DisableLog("rdApp.warning")
@@ -38,6 +42,37 @@ try:
     from ase.mep import NEB, NEBTools
 except ImportError:  # ASE < 3.23
     from ase.neb import NEB, NEBTools
+
+
+# --------------------------------------------------------------------------- #
+# Radii / contact distances
+# --------------------------------------------------------------------------- #
+def vdw_radius(Z):
+    """Bondi vdW radius (Å); falls back to Alvarez, then 2 x covalent radius."""
+    Z = np.asarray(Z, int)
+    r = np.asarray(_vdw_bondi, float)[Z]
+    r = np.where(np.isnan(r), np.asarray(_vdw_alvarez, float)[Z], r)
+    return np.where(np.isnan(r), 2.0 * covalent_radii[Z], r)
+
+
+def contact_distance(Zi, Zj, shift="vdw", vdw_scale=1.0):
+    """Target separation for a forming/breaking pair (vectorised over Zi, Zj)."""
+    Zi, Zj = np.asarray(Zi, int), np.asarray(Zj, int)
+    if isinstance(shift, str):
+        if shift.lower() != "vdw":
+            raise ValueError(f"shift must be a number or 'vdw', got {shift!r}")
+        return vdw_scale * (vdw_radius(Zi) + vdw_radius(Zj))
+    return float(shift) * (covalent_radii[Zi] + covalent_radii[Zj])
+
+
+def vdw_shift(atoms, pairs, scale=1.0):
+    """Equivalent covalent-radius shift for vdW contact (for reporting)."""
+    Z = atoms.numbers
+    return max(
+        float(contact_distance(Z[i], Z[j], "vdw", scale))
+        / (covalent_radii[Z[i]] + covalent_radii[Z[j]])
+        for i, j in pairs
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -210,27 +245,35 @@ def _apply(x, pos, frags):
 
 
 def rigid_fit(
-    atoms, frags, targets, ref=None, shift=1.5, w_ref=0.01, n_starts=10, seed=0
+    atoms,
+    frags,
+    targets,
+    ref=None,
+    shift="vdw",
+    vdw_scale=1.0,
+    w_ref=0.01,
+    n_starts=10,
+    seed=0,
 ):
     """Rotate/translate each molecule (rigidly) to minimise
         Σ_targets (r_ij - d_ij)^2 + 10 Σ_inter max(0, r_min - r_ij)^2 + w_ref Σ |x - ref|^2
-    with d_ij = r_min = shift * (r_cov_i + r_cov_j) (r_min >= 2 Å for non-target pairs)."""
+    with d_ij = r_min = contact_distance(Z_i, Z_j, shift, vdw_scale)
+    (r_min >= 2 Å for non-target pairs)."""
     pos, Z = atoms.positions, atoms.numbers
-    rc = covalent_radii[Z]
     fid = np.empty(len(atoms), int)
     for k, idx in enumerate(frags):
         fid[idx] = k
-    tset = {tuple(sorted(t)) for t in targets}
+    tset = {tuple(sorted(map(int, t))) for t in targets}
     ti = np.array([t[0] for t in tset], int)
     tj = np.array([t[1] for t in tset], int)
-    td = shift * (rc[ti] + rc[tj])
+    td = contact_distance(Z[ti], Z[tj], shift, vdw_scale)
     pr = [
         (i, j)
         for i, j in itertools.combinations(range(len(atoms)), 2)
         if fid[i] != fid[j] and (i, j) not in tset
     ]
     ri, rj = (np.array(a, int) for a in zip(*pr)) if pr else (np.array([], int),) * 2
-    rmin = np.maximum(shift * (rc[ri] + rc[rj]), 2.0)
+    rmin = np.maximum(contact_distance(Z[ri], Z[rj], shift, vdw_scale), 2.0)
 
     def cost(x):
         X = _apply(x, pos, frags)
@@ -274,15 +317,21 @@ def rigid_fit(
 def make_endpoints(
     reactants,
     products,
-    shift=1.5,
+    shift="vdw",
+    vdw_scale=1.0,
     seed=42,
     n_confs=10,
     max_isomorphisms=500,
     verbose=True,
 ):
     """Build (reactant_complex, product_complex) Atoms with identical atom order,
-    positioned/rotated consistently for NEB. Info dicts hold charge, mult and the
-    formed/broken bonds (reactant indices)."""
+    positioned/rotated consistently for NEB.
+
+    shift : "vdw" (default) puts forming/breaking pairs at
+            vdw_scale * (r_vdw_i + r_vdw_j), i.e. van der Waals contact;
+            a float gives the old shift * (r_cov_i + r_cov_j).
+    Info dicts hold charge, mult, the formed/broken bonds (reactant indices) and
+    the target distance of each changed pair ('contact')."""
     R, G_r, fr_r = _side(reactants, seed)
     P, G_p, fr_p = _side(products, seed)
     try:
@@ -291,6 +340,7 @@ def make_endpoints(
         )
     except StopIteration:
         raise RuntimeError("No bond rearrangement found (try max_extra=2)") from None
+    fit = dict(shift=shift, vdw_scale=vdw_scale)
 
     # template = side with fewer molecules (products on a tie)
     prod_is_tmpl = len(fr_p) <= len(fr_r)
@@ -314,7 +364,7 @@ def make_endpoints(
         t_targets = [
             (m0[i], m0[j]) for i, j in G_o.edges if not G_t.has_edge(m0[i], m0[j])
         ]
-        T, _ = rigid_fit(T, fr_t, t_targets, shift=shift)
+        T, _ = rigid_fit(T, fr_t, t_targets, **fit)
 
     # pick the symmetry-equivalent mapping + conformer of each molecule on the
     # other side that best overlays the template (e.g. s-cis butadiene for D-A)
@@ -342,7 +392,7 @@ def make_endpoints(
         for i, j in itertools.combinations(range(len(O)), 2)
         if G_t.has_edge(tmap[i], tmap[j]) and not G_o.has_edge(i, j)
     ]
-    O, _ = rigid_fit(O, fr_o, o_targets, ref=ref, shift=shift)
+    O, _ = rigid_fit(O, fr_o, o_targets, ref=ref, **fit)
 
     # put both in reactant atom order
     if prod_is_tmpl:
@@ -353,16 +403,30 @@ def make_endpoints(
     prod.info = dict(P.info)
     reac.positions -= reac.get_center_of_mass()
     minimize_rotation_and_translation(reac, prod)
+
+    Z = reac.numbers
+    contact = {
+        tuple(map(int, b)): float(contact_distance(Z[b[0]], Z[b[1]], **fit))
+        for b in list(fb) + list(bb)
+    }
     for a in (reac, prod):
         a.info.update(
             formed=[tuple(map(int, b)) for b in fb],
             broken=[tuple(map(int, b)) for b in bb],
+            shift=shift,
+            vdw_scale=vdw_scale,
+            contact=contact,
         )
     if verbose:
         sym = reac.get_chemical_symbols()
         lab = lambda b: f"{sym[b[0]]}{b[0]}-{sym[b[1]]}{b[1]}"
+        d_r = {lab(b): f"{reac.get_distance(*b):.2f}" for b in fb}
+        d_p = {lab(b): f"{prod.get_distance(*b):.2f}" for b in bb}
         print(
             f"{' + '.join(reactants)} -> {' + '.join(products)} | "
-            f"form: {[lab(b) for b in fb]}  break: {[lab(b) for b in bb]}"
+            f"form: {[lab(b) for b in fb]}  break: {[lab(b) for b in bb]}\n"
+            f"  shift={shift!r}"
+            + (f" (x{vdw_scale})" if shift == "vdw" else "")
+            + f" | forming in reactant (Å): {d_r} | breaking in product (Å): {d_p}"
         )
     return reac, prod
