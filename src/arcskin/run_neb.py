@@ -106,7 +106,7 @@ def run_all(
             logfile=logfile,
         )
         fit = forcecurve.fit_images(images)
-        if np.max(fit.path) <= 1:
+        if np.max(fit.path) <= 0.5:
             # need more checks
             sane = False
         else:
