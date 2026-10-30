@@ -12,7 +12,6 @@ from arcskin.nanoreactor_run import smiles_to_atoms
 import warnings
 from tblite.ase import TBLite
 from ase.optimize import BFGS
-from aimnet.calculators import AIMNet2ASE
 from monty.serialization import loadfn
 from rdkit import Chem
 from rdkit import DataStructs
@@ -22,6 +21,7 @@ import numpy as np
 import tqdm_pathos
 import multiprocess as mp
 import warp as wp
+from aimnet.calculators import AIMNet2ASE
 import warnings
 
 
