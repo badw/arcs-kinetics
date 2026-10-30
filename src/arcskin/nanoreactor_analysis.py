@@ -324,6 +324,7 @@ class AnalyseNanoReactor:
         )
         self.unique_smiles_counter = Counter(it.chain(*d))
         self.remove_similars()
+        self.get_sensible_smiles()
 
     def remove_similars(self):
         try:  # from previous format... will deprecate later
@@ -379,6 +380,7 @@ class AnalyseNanoReactor:
         return similar
 
     def get_possible_paths_dict(self):
+
         if self.sensible_outcomes:
             possible_paths = {
                 i: {"reactants": self.reactants, "products": prod}

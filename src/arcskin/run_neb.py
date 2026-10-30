@@ -7,6 +7,7 @@ from ase.optimize import BFGS, FIRE
 import numpy as np
 import pandas as pd
 from ase.utils import forcecurve
+import tqdm
 
 
 def relax(atoms, calc, fmax=0.05, steps=200, logfile=None):
@@ -91,7 +92,7 @@ def run_all(
         calc = calculator
     results = {}
 
-    for k, v in endpoints_dict.items():
+    for k, v in tqdm.tqdm(endpoints_dict.items()):
         reactants = relax(v["reactants"], calc)
         products = relax(v["products"], calc)
         images, E, Ea, dE = run_neb(
