@@ -312,7 +312,7 @@ class AnalyseNanoReactor:
         self.remove_similars()
 
     def analyse_trajectories(
-        self, tolerance: float = 0.3, n_cpus=4, tqdm_kws={"disable": True}
+        self, tolerance: float = 0.3, n_cpus=4, tqdm_kws={"disable": False}
     ):
         frames = list(it.chain(*list(self.trajectory.values())))
         d = tqdm_pathos.map(

@@ -19,7 +19,7 @@ num_molecules = 4
 num_runs = 4
 min_distance = 2.2
 nano_reactor_temperature = 1200
-total_time = 10
+total_time = 5
 directory = "./so3_h2o/"
 
 molecules = {"SO3": "O=S(=O)=O", "H2O": "O"}
