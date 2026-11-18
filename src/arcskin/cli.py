@@ -14,14 +14,14 @@ Every reactant and discovered product is also recorded in a `compounds` table.
     arcskin suggest -n 10
     arcskin network "2 [N]=O + O=O -> 2 [O][N]=O"
 
-Each `run` writes a human-readable log to <dir>/arcskin.log; `network` writes
-<dir>/network.log plus one sub-directory (and log) per A + B pair it runs.
+Each A + B pair runs in its own SMILES1_SMILES2/ directory with a log in
+SMILES1_SMILES2/arcskin.log, whether started by `run` or `network`. `network`
+appends its own summary to network.log; pairs already in the database are reused.
 """
 
 import argparse
 import contextlib
 import datetime
-import hashlib
 import itertools
 import json
 import os
@@ -465,25 +465,78 @@ def reach(start, steps):
     return made, gen
 
 
-def mechanism(targets, made):
-    """Back-trace the steps needed to make `targets`, in dependency order."""
-    order, seen = [], set()
+def net(reactants, products, k=1):
+    """Net stoichiometry {skeleton: coeff} (products +, reactants -)."""
+    c = Counter()
+    for x in products:
+        c[skeleton(x)] += k
+    for x in reactants:
+        c[skeleton(x)] -= k
+    return {sp: v for sp, v in c.items() if v}
 
-    def visit(sp):
-        st = made.get(sp)
-        if st is None:
-            return
-        sid = (st["source"], st["pathway"])
-        if sid in seen:
-            return
-        seen.add(sid)
-        for r in st["reactants"]:
-            visit(r)
-        order.append(st)
 
-    for t in targets:
-        visit(t)
-    return order
+def balance(reactants, products, steps, max_mult=4):
+    """Find whole-number multiples of `steps` that add up exactly to the overall
+    reaction (k x overall, k >= 1), so every intermediate cancels.
+
+    Minimises the rate-limiting (largest) barrier first, then the number of step
+    uses. Returns (k, [(multiplier, step), ...] in a runnable order) or None."""
+    import numpy as np
+    from scipy.optimize import Bounds, LinearConstraint, milp
+
+    target = net(reactants, products)
+    uniq = {}  # one copy of each distinct, atom-balanced, non-trivial step
+    for st in steps:
+        v = net(st["reactants"], st["products"])
+        if not v or atom_counts(st["reactants"]) != atom_counts(st["products"]):
+            continue
+        sig = tuple(sorted(v.items()))
+        if sig not in uniq or st["Ea"] < uniq[sig][0]["Ea"]:
+            uniq[sig] = (st, v)
+    if not uniq:
+        return None
+    cand = sorted(uniq.values(), key=lambda sv: sv[0]["Ea"])
+    species = sorted(set(target) | {sp for _, v in cand for sp in v})
+
+    for cut in sorted({st["Ea"] for st, _ in cand}):  # minimax barrier
+        use = [(st, v) for st, v in cand if st["Ea"] <= cut]
+        n = len(use)
+        A = np.array([[v.get(sp, 0) for _, v in use] + [-target.get(sp, 0)]
+                      for sp in species], float)
+        res = milp(c=np.r_[np.ones(n), 0.0],
+                   constraints=LinearConstraint(A, 0, 0),
+                   integrality=np.ones(n + 1),
+                   bounds=Bounds(np.r_[np.zeros(n), 1], np.r_[np.full(n, max_mult), max_mult]))
+        if res.success:
+            x = np.rint(res.x).astype(int)
+            chosen = [(int(m), st) for m, (st, _) in zip(x[:n], use) if m > 0]
+            return int(x[n]), order_steps(chosen, reactants, int(x[n]))
+    return None
+
+
+def order_steps(chosen, reactants, k):
+    """Order (mult, step) so each step's reactants exist when it runs."""
+    have = Counter()
+    for x in reactants:
+        have[skeleton(x)] += k
+    todo, out = [[m, st] for m, st in chosen], []
+    while todo:
+        for item in todo:
+            need = Counter(skeleton(x) for x in item[1]["reactants"])
+            if all(have[sp] >= c for sp, c in need.items()):
+                have.subtract(need)
+                have.update(skeleton(x) for x in item[1]["products"])
+                item[0] -= 1
+                if not out or out[-1][1] is not item[1]:
+                    out.append([0, item[1]])
+                out[-1][0] += 1
+                if item[0] == 0:
+                    todo.remove(item)
+                break
+        else:  # needs a species made later (cycle/catalyst): append the rest
+            out += todo
+            break
+    return [(m, st) for m, st in out]
 
 
 def candidate_pairs(db, pool, gen, tried, retry_failed=False):
@@ -502,10 +555,10 @@ def candidate_pairs(db, pool, gen, tried, retry_failed=False):
 
 
 def print_mechanism(steps):
-    table([(i + 1, fmt_rxn(st["reactants"], st["products"]), fnum(st["Ea"]),
+    table([(i + 1, f"{m}x", fmt_rxn(st["reactants"], st["products"]), fnum(st["Ea"]),
             fnum(st["dE"]), st["kind"], f"{st['source']} #{st['pathway']}")
-           for i, st in enumerate(steps)],
-          ["step", "reaction", "Ea/eV", "dE/eV", "kind", "from run"])
+           for i, (m, st) in enumerate(steps)],
+          ["step", "times", "reaction", "Ea/eV", "dE/eV", "kind", "from run"])
 
 
 def cmd_network(args):
@@ -513,9 +566,7 @@ def cmd_network(args):
     reactants, products = parse_reaction(args.reaction)
     targets = sorted(set(products) - set(reactants))
     overall = f"{' + '.join(reactants)} -> {' + '.join(products)}"
-    tag = hashlib.md5(overall.encode()).hexdigest()[:6]
-    directory = args.dir or "network_" + slug(".".join(sorted(set(reactants)))
-                                              + "_to_" + ".".join(targets)) + "_" + tag
+    directory = args.dir or "."
     os.makedirs(directory, exist_ok=True)
     logfile = os.path.join(directory, "network.log")
     console = sys.stdout
@@ -546,11 +597,21 @@ def cmd_network(args):
                 f"{len(made)} species reachable; targets reached: "
                 f"{len(have)}/{len(targets)}")
             if len(have) == len(targets):
-                for t in targets:
-                    if found[t] != t:
-                        log(f"target {t} matched as {found[t]} (same connectivity)")
-                mech = mechanism([found[t] for t in targets], made)
-                break
+                usable = [st for st in steps
+                          if all(r in made for r in st["reactants"])]
+                mech = balance(reactants, products, usable, args.max_mult)
+                if mech:
+                    rl = max(st["Ea"] for _, st in mech[1])
+                    for t in targets:
+                        if found[t] != t:
+                            log(f"target {t} matched as {found[t]} (same connectivity)")
+                    if not args.best:
+                        break
+                    log(f"balanced mechanism found (rate-limiting Ea = {rl:.3f} eV); "
+                        f"--best: continuing to look for a lower one")
+                else:
+                    log("targets reachable, but no combination of steps balances "
+                        "the overall reaction yet; continuing")
             cands = candidate_pairs(db, made, gen, tried, args.retry_failed)
             if not cands:
                 log("no untried pairs left")
@@ -584,28 +645,38 @@ def cmd_network(args):
         print(f"  finished  : {now()}  ({runs} new pair run(s))")
         if mech is None:
             missing = [t for t in targets if not found[t]]
-            print(f"  NO mechanism found. Unreached target(s): {', '.join(missing)}")
+            if missing:
+                print(f"  NO mechanism found. Unreached target(s): {', '.join(missing)}")
+            else:
+                print("  NO mechanism found. All targets are reachable, but no "
+                      "combination of steps balances the overall reaction")
             print(f"  reachable species: {', '.join(sorted(made))}")
             print("  try raising --max-ea / --max-runs, or --retry-failed")
             networks.upsert(jsanitize({"overall": overall, "status": "not found",
                                        "reachable": sorted(made), "updated": now()}),
                             N.overall == overall)
         else:
-            rls = max(mech, key=lambda st: st["Ea"])
-            consumed = {r for st in mech for r in st["reactants"]}
-            made_here = {p for st in mech for p in st["products"]}
-            byproducts = sorted(made_here - consumed - set(found.values()))
+            k, steps_used = mech
+            rls = max((st for _, st in steps_used), key=lambda st: st["Ea"])
             section("mechanism")
-            print_mechanism(mech)
-            print(f"\n  rate-limiting step : {fmt_rxn(rls['reactants'], rls['products'])}"
+            print_mechanism(steps_used)
+            total, name = Counter(), {}
+            for m, st in steps_used:
+                for x in st["reactants"] + st["products"]:
+                    name.setdefault(skeleton(x), x)
+                for sp, v in net(st["reactants"], st["products"], m).items():
+                    total[name[sp]] += v
+            lhs = [f"{-v} {sp}" for sp, v in sorted(total.items()) if v < 0]
+            rhs = [f"{v} {sp}" for sp, v in sorted(total.items()) if v > 0]
+            print(f"\n  net                : {' + '.join(lhs)} -> {' + '.join(rhs)}"
+                  + (f"   (= {k} x overall)" if k > 1 else "   (= overall)"))
+            print(f"  rate-limiting step : {fmt_rxn(rls['reactants'], rls['products'])}"
                   f"  (Ea = {rls['Ea']:.3f} eV)")
-            if byproducts:
-                print(f"  byproducts         : {', '.join(byproducts)}")
-            print("  note: steps are not stoichiometrically balanced against the "
-                  "overall reaction")
             networks.upsert(jsanitize({"overall": overall, "status": "found",
-                                       "mechanism": mech, "rate_limiting": rls,
-                                       "byproducts": byproducts, "updated": now()},
+                                       "multiple": k,
+                                       "mechanism": [dict(st, times=m)
+                                                     for m, st in steps_used],
+                                       "rate_limiting": rls, "updated": now()},
                                       strict=False),
                             N.overall == overall)
         print(f"\nlog written to {logfile}")
@@ -679,11 +750,19 @@ def main(argv=None):
                        "is connected by reasonable steps")
     w.add_argument("reaction", help="SMILES reaction, e.g. "
                    "\"2 [N]=O + O=O -> 2 [O][N]=O\"")
-    w.add_argument("--dir", help="working directory (default: from the reaction)")
+    w.add_argument("--dir", help="where the SMILES1_SMILES2/ pair directories and "
+                   "network.log go (default: current directory)")
     w.add_argument("--max-ea", type=float, default=1.0,
                    help="largest barrier (eV) a step may have (default 1.0)")
     w.add_argument("--max-runs", type=int, default=20,
                    help="maximum number of new pair runs (default 20)")
+    w.add_argument("--max-mult", type=int, default=4,
+                   help="most times one step may be used in the balanced "
+                   "mechanism (default 4)")
+    w.add_argument("--best", action="store_true",
+                   help="don't stop at the first balanced mechanism: run pairs "
+                   "until --max-runs / none left, then report the one with the "
+                   "lowest rate-limiting barrier")
     w.add_argument("--retry-failed", action="store_true",
                    help="also rerun pairs whose earlier run failed")
     run_options(w)
