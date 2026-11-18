@@ -12,19 +12,23 @@ Every reactant and discovered product is also recorded in a `compounds` table.
     arcskin show "O=S(=O)=O" "O"
     arcskin compounds
     arcskin suggest -n 10
+    arcskin network "2 [N]=O + O=O -> 2 [O][N]=O"
 
-Each `run` writes a human-readable log to <dir>/arcskin.log.
+Each `run` writes a human-readable log to <dir>/arcskin.log; `network` writes
+<dir>/network.log plus one sub-directory (and log) per A + B pair it runs.
 """
 
 import argparse
 import contextlib
 import datetime
+import hashlib
 import itertools
 import json
 import os
 import re
 import sys
 import traceback
+from collections import Counter
 
 from monty.json import jsanitize
 from rdkit import Chem, RDLogger
@@ -150,13 +154,13 @@ def run_log(path):
     with open(path, "a") as fh, contextlib.redirect_stdout(Tee(sys.stdout, fh)):
         try:
             yield
-        except BaseException:
+        except (Exception, KeyboardInterrupt):
             section("ERROR")
             traceback.print_exc(file=sys.stdout)
             raise
 
 
-def run_pipeline(args, db, key, directory):
+def run_pipeline(args, db, key, directory, suggest=True):
     # heavy imports only when actually running
     from arcskin.make_neb_endpoints import make_endpoints
     from arcskin.nanoreactor_analysis import AnalyseNanoReactor
@@ -261,8 +265,9 @@ def run_pipeline(args, db, key, directory):
         print(f"              + {n}")
     section("suggested pathway(s)")
     print_best(best)
-    section("next combinations to try")
-    print_suggestions(suggest_pairs(db, limit=5))
+    if suggest:
+        section("next combinations to try")
+        print_suggestions(suggest_pairs(db, limit=5))
     print()
 
 
@@ -340,17 +345,270 @@ def cmd_run(args):
     if entry and entry.get("status") == "complete" and not args.force:
         print_best(entry.get("best_pathways", []))
         sys.exit(f"error: {key} has already been run (in {args.db}); use --force to rerun")
-    directory = args.dir or re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_")
+    run_pair(args, db, key, args.dir or slug(key))
+
+
+def slug(text):
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")
+
+
+def run_pair(args, db, key, directory, suggest=True):
+    """Run the pipeline for args.smiles1 + args.smiles2 with a log in `directory`."""
     os.makedirs(directory, exist_ok=True)
     logfile = os.path.join(directory, "arcskin.log")
     with run_log(logfile):
         try:
-            run_pipeline(args, db, key, directory)
+            run_pipeline(args, db, key, directory, suggest=suggest)
         except Exception as e:
             save(db, key, status=f"failed: {e}")
             raise
         finally:
             print(f"log written to {logfile}")
+
+
+# --------------------------------------------------------------------------
+# network: search A + B pairs until the overall reaction is connected
+# --------------------------------------------------------------------------
+def parse_side(text):
+    """'2 [N]=O + O=O' -> ['[N]=O', '[N]=O', 'O=O'] (canonical SMILES)."""
+    out = []
+    for term in re.split(r"\s+\+\s+", text.strip()):
+        term = term.strip()
+        m = re.fullmatch(r"(\d+)\s*\*?\s*(\S+)", term)
+        n, smi = (int(m.group(1)), m.group(2)) if m else (1, term)
+        try:
+            out += [canon(smi, strict=True)] * n
+        except ValueError:
+            raise ValueError(f"{smi!r} is not valid SMILES (formulas like NO2 are not "
+                             f"supported; use e.g. [O][N]=O)") from None
+    return out
+
+
+def parse_reaction(text):
+    """Split 'A + B -> C' (also '>>', '=>' or ' = ' with spaces) into two sides."""
+    parts = re.split(r"\s*(?:->|>>|=>)\s*|\s+=\s+", text.strip())
+    if len(parts) != 2:
+        raise ValueError("write the reaction as 'A + B -> C' (or ' = ' with spaces)")
+    return parse_side(parts[0]), parse_side(parts[1])
+
+
+def atom_counts(smiles):
+    c = Counter()
+    for smi in smiles:
+        mol = Chem.AddHs(Chem.MolFromSmiles(smi))
+        c.update(a.GetSymbol() for a in mol.GetAtoms())
+        c["charge"] += Chem.GetFormalCharge(mol)
+    return +c
+
+
+def skeleton(smi):
+    """Connectivity-only key (all-H graph, single bonds, no charges/radicals), so
+    e.g. [O]N=O and O=[N+][O-] both count as NO2."""
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return smi
+    mol = Chem.RWMol(Chem.AddHs(mol))
+    for b in mol.GetBonds():
+        b.SetBondType(Chem.BondType.SINGLE)
+        b.SetIsAromatic(False)
+    for a in mol.GetAtoms():
+        a.SetFormalCharge(0)
+        a.SetNumRadicalElectrons(0)
+        a.SetIsAromatic(False)
+        a.SetNoImplicit(True)
+    return Chem.MolToSmiles(mol)
+
+
+def match_targets(targets, made):
+    """{target: species in `made` with the same connectivity (or None)}."""
+    by_skel = {}
+    for sp in made:
+        by_skel.setdefault(skeleton(sp), sp)
+    return {t: (t if t in made else by_skel.get(skeleton(t))) for t in targets}
+
+
+def reasonable_steps(db, max_ea):
+    """Every sane NEB pathway in the database with Ea <= max_ea."""
+    steps = []
+    for e in db.all():
+        if e.get("status") != "complete":
+            continue
+        for r in e.get("neb") or []:
+            try:
+                ea = float(r["Ea"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if r.get("sane") and ea <= max_ea:
+                steps.append({
+                    "source": e["key"], "pathway": r.get("pathway"),
+                    "reactants": [canon(x) for x in r["reactants"]],
+                    "products": [canon(x) for x in r["products"]],
+                    "Ea": ea, "dE": r.get("dE"), "kind": r.get("kind", ""),
+                })
+    return sorted(steps, key=lambda st: st["Ea"])
+
+
+def reach(start, steps):
+    """Species reachable from `start` through `steps`.
+    Returns {species: producing step or None}, {species: generation}."""
+    made = {s: None for s in start}
+    gen = {s: 0 for s in start}
+    changed = True
+    while changed:
+        changed = False
+        for st in steps:  # lowest Ea first, so it wins when several steps make X
+            if all(r in made for r in st["reactants"]):
+                g = 1 + max(gen[r] for r in st["reactants"])
+                for p in st["products"]:
+                    if p not in made:
+                        made[p], gen[p], changed = st, g, True
+    return made, gen
+
+
+def mechanism(targets, made):
+    """Back-trace the steps needed to make `targets`, in dependency order."""
+    order, seen = [], set()
+
+    def visit(sp):
+        st = made.get(sp)
+        if st is None:
+            return
+        sid = (st["source"], st["pathway"])
+        if sid in seen:
+            return
+        seen.add(sid)
+        for r in st["reactants"]:
+            visit(r)
+        order.append(st)
+
+    for t in targets:
+        visit(t)
+    return order
+
+
+def candidate_pairs(db, pool, gen, tried, retry_failed=False):
+    """Untried A + B pairs (A may equal B) from `pool`, earliest generation first."""
+    status = {e["key"]: e.get("status", "") for e in db.all()}
+    out = []
+    for a, b in itertools.combinations_with_replacement(sorted(pool), 2):
+        key = reaction_key(a, b)
+        st = status.get(key)
+        if key in tried or st == "complete" or st == "running":
+            continue
+        if st and st.startswith("failed") and not retry_failed:
+            continue
+        out.append(((max(gen[a], gen[b]), gen[a] + gen[b], a == b, key), a, b, key))
+    return [(a, b, key) for _, a, b, key in sorted(out)]
+
+
+def print_mechanism(steps):
+    table([(i + 1, fmt_rxn(st["reactants"], st["products"]), fnum(st["Ea"]),
+            fnum(st["dE"]), st["kind"], f"{st['source']} #{st['pathway']}")
+           for i, st in enumerate(steps)],
+          ["step", "reaction", "Ea/eV", "dE/eV", "kind", "from run"])
+
+
+def cmd_network(args):
+    db = TinyDB(args.db)
+    reactants, products = parse_reaction(args.reaction)
+    targets = sorted(set(products) - set(reactants))
+    overall = f"{' + '.join(reactants)} -> {' + '.join(products)}"
+    tag = hashlib.md5(overall.encode()).hexdigest()[:6]
+    directory = args.dir or "network_" + slug(".".join(sorted(set(reactants)))
+                                              + "_to_" + ".".join(targets)) + "_" + tag
+    os.makedirs(directory, exist_ok=True)
+    logfile = os.path.join(directory, "network.log")
+    console = sys.stdout
+    networks, N = db.table("networks"), Query()
+
+    with run_log(logfile):
+        banner(f"ARCS-Kinetics network search: {overall}")
+        print(f"  started   : {now()}")
+        print(f"  directory : {os.path.abspath(directory)}")
+        print(f"  database  : {os.path.abspath(args.db)}")
+        print(f"  targets   : {', '.join(targets)}")
+        print(f"  criteria  : sane NEB pathway with Ea <= {args.max_ea} eV; "
+              f"at most {args.max_runs} new pair run(s)")
+        ra, pa = atom_counts(reactants), atom_counts(products)
+        if ra != pa:
+            print(f"  WARNING   : overall reaction is not balanced "
+                  f"({dict(ra)} vs {dict(pa)})")
+        if not targets:
+            sys.exit("error: nothing to make (all products are also reactants)")
+
+        runs, tried, mech = 0, set(), None
+        while True:
+            steps = reasonable_steps(db, args.max_ea)
+            made, gen = reach(set(reactants), steps)
+            found = match_targets(targets, made)
+            have = [t for t in targets if found[t]]
+            log(f"{len(steps)} reasonable step(s) in database; "
+                f"{len(made)} species reachable; targets reached: "
+                f"{len(have)}/{len(targets)}")
+            if len(have) == len(targets):
+                for t in targets:
+                    if found[t] != t:
+                        log(f"target {t} matched as {found[t]} (same connectivity)")
+                mech = mechanism([found[t] for t in targets], made)
+                break
+            cands = candidate_pairs(db, made, gen, tried, args.retry_failed)
+            if not cands:
+                log("no untried pairs left")
+                break
+            if runs >= args.max_runs:
+                log(f"reached --max-runs ({args.max_runs}); "
+                    f"{len(cands)} pair(s) still untried")
+                break
+            a, b, key = cands[0]
+            runs += 1
+            tried.add(key)
+            section(f"run {runs}/{args.max_runs}: {a} + {b}  "
+                    f"(generation {max(gen[a], gen[b])}, {len(cands) - 1} more queued)")
+            pargs = argparse.Namespace(**vars(args))
+            pargs.smiles1, pargs.smiles2, pargs.dir = a, b, None
+            pair_dir = os.path.join(directory, slug(key))
+            n_before = len(steps)
+            try:
+                with contextlib.redirect_stdout(console):  # details -> pair log only
+                    run_pair(pargs, db, key, pair_dir, suggest=False)
+            except Exception as e:
+                log(f"FAILED: {e}  (see {pair_dir}/arcskin.log)")
+                continue
+            entry = get_entry(db, key)
+            log(f"done -> {pair_dir}/arcskin.log")
+            print_best(entry.get("best_pathways") or [])
+            new = len(reasonable_steps(db, args.max_ea)) - n_before
+            log(f"{new} new reasonable step(s)")
+
+        banner("result")
+        print(f"  finished  : {now()}  ({runs} new pair run(s))")
+        if mech is None:
+            missing = [t for t in targets if not found[t]]
+            print(f"  NO mechanism found. Unreached target(s): {', '.join(missing)}")
+            print(f"  reachable species: {', '.join(sorted(made))}")
+            print("  try raising --max-ea / --max-runs, or --retry-failed")
+            networks.upsert(jsanitize({"overall": overall, "status": "not found",
+                                       "reachable": sorted(made), "updated": now()}),
+                            N.overall == overall)
+        else:
+            rls = max(mech, key=lambda st: st["Ea"])
+            consumed = {r for st in mech for r in st["reactants"]}
+            made_here = {p for st in mech for p in st["products"]}
+            byproducts = sorted(made_here - consumed - set(found.values()))
+            section("mechanism")
+            print_mechanism(mech)
+            print(f"\n  rate-limiting step : {fmt_rxn(rls['reactants'], rls['products'])}"
+                  f"  (Ea = {rls['Ea']:.3f} eV)")
+            if byproducts:
+                print(f"  byproducts         : {', '.join(byproducts)}")
+            print("  note: steps are not stoichiometrically balanced against the "
+                  "overall reaction")
+            networks.upsert(jsanitize({"overall": overall, "status": "found",
+                                       "mechanism": mech, "rate_limiting": rls,
+                                       "byproducts": byproducts, "updated": now()},
+                                      strict=False),
+                            N.overall == overall)
+        print(f"\nlog written to {logfile}")
 
 
 def cmd_list(args):
@@ -396,23 +654,40 @@ def main(argv=None):
                    help="TinyDB file (default: arcskin_db.json or $ARCSKIN_DB)")
     sub = p.add_subparsers(required=True)
 
+    def run_options(r):
+        r.add_argument("--num-molecules", type=int, default=4, help="copies of each molecule")
+        r.add_argument("--num-runs", type=int, default=4, help="number of nanoreactor seeds")
+        r.add_argument("--min-dist", type=float, default=2.2)
+        r.add_argument("--temperature", type=int, default=1200)
+        r.add_argument("--time", type=float, default=5.0, help="MD time (ps)")
+        r.add_argument("--skip-step", type=int, default=10)
+        r.add_argument("--n-cpus", type=int, default=4)
+        r.add_argument("--n-images", type=int, default=16)
+        r.add_argument("--fmax", type=float, default=0.05)
+        r.add_argument("--ea-tol", type=float, default=0.1,
+                       help="also suggest pathways with Ea within this of the best (eV)")
+
     r = sub.add_parser("run", help="run the full pipeline for two SMILES")
     r.add_argument("smiles1")
     r.add_argument("smiles2")
     r.add_argument("--dir", help="working directory (default: from SMILES)")
-    r.add_argument("--num-molecules", type=int, default=4, help="copies of each molecule")
-    r.add_argument("--num-runs", type=int, default=4, help="number of nanoreactor seeds")
-    r.add_argument("--min-dist", type=float, default=2.2)
-    r.add_argument("--temperature", type=int, default=1200)
-    r.add_argument("--time", type=float, default=5.0, help="MD time (ps)")
-    r.add_argument("--skip-step", type=int, default=10)
-    r.add_argument("--n-cpus", type=int, default=4)
-    r.add_argument("--n-images", type=int, default=16)
-    r.add_argument("--fmax", type=float, default=0.05)
-    r.add_argument("--ea-tol", type=float, default=0.1,
-                   help="also suggest pathways with Ea within this of the best (eV)")
+    run_options(r)
     r.add_argument("--force", action="store_true", help="rerun even if in database")
     r.set_defaults(func=cmd_run)
+
+    w = sub.add_parser("network", help="run A + B pairs until an overall reaction "
+                       "is connected by reasonable steps")
+    w.add_argument("reaction", help="SMILES reaction, e.g. "
+                   "\"2 [N]=O + O=O -> 2 [O][N]=O\"")
+    w.add_argument("--dir", help="working directory (default: from the reaction)")
+    w.add_argument("--max-ea", type=float, default=1.0,
+                   help="largest barrier (eV) a step may have (default 1.0)")
+    w.add_argument("--max-runs", type=int, default=20,
+                   help="maximum number of new pair runs (default 20)")
+    w.add_argument("--retry-failed", action="store_true",
+                   help="also rerun pairs whose earlier run failed")
+    run_options(w)
+    w.set_defaults(func=cmd_network)
 
     l = sub.add_parser("list", help="list reactions in the database")
     l.set_defaults(func=cmd_list)
