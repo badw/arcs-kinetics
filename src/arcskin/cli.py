@@ -73,8 +73,8 @@ def best_pathways(ranking, ea_tol):
     sane = ranking[ranking["sane"].astype(bool)]
     pool = sane if len(sane) else ranking
     best = pool[pool["Ea"] <= pool["Ea"].min() + ea_tol]
-    cols = ["pathway", "reactants", "products", "Ea", "dE", "sane"]
-    return [{c: row[c] for c in cols} for _, row in best.iterrows()]
+    cols = ["pathway", "reactants", "products", "Ea", "dE", "sane", "kind", "reason"]
+    return [{c: row.get(c) for c in cols} for _, row in best.iterrows()]
 
 
 # --------------------------------------------------------------------------
@@ -242,9 +242,10 @@ def run_pipeline(args, db, key, directory):
             best = best_pathways(ranking, args.ea_tol)
             log("NEB ranking:")
             table([(r["pathway"], fmt_rxn(r["reactants"], r["products"]),
-                    fnum(r["Ea"]), fnum(r["dE"]), bool(r["sane"]))
+                    fnum(r["Ea"]), fnum(r["dE"]), bool(r["sane"]),
+                    r.get("kind"), r.get("reason") or "")
                    for _, r in ranking.sort_values("Ea").iterrows()],
-                  ["#", "pathway", "Ea/eV", "dE/eV", "sane"])
+                  ["#", "pathway", "Ea/eV", "dE/eV", "sane", "kind", "note"])
         else:
             log("no endpoints could be built; skipping NEB")
 
@@ -270,8 +271,8 @@ def print_best(best):
         print("  no pathway found")
         return
     table([(b["pathway"], fmt_rxn(b["reactants"], b["products"]),
-            fnum(b["Ea"]), fnum(b["dE"])) for b in best],
-          ["#", "pathway", "Ea/eV", "dE/eV"])
+            fnum(b["Ea"]), fnum(b["dE"]), b.get("kind") or "") for b in best],
+          ["#", "pathway", "Ea/eV", "dE/eV", "kind"])
 
 
 # --------------------------------------------------------------------------

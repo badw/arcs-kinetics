@@ -22,7 +22,7 @@ from ase.constraints import FixBondLengths
 from ase.data import covalent_radii
 from ase.optimize import BFGS
 
-from arkskin.make_neb_endpoints import _side, make_endpoints
+from arcskin.make_neb_endpoints import _side, make_endpoints
 
 
 # --------------------------------------------------------------------------- #
