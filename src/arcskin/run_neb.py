@@ -1,4 +1,7 @@
 # from tblite.ase import TBLite
+import warp as wp
+
+wp.config.log_level = wp.LOG_WARNING  # no 'Warp initialized' banner
 from aimnet.calculators import AIMNet2ASE
 from ase.build import minimize_rotation_and_translation
 from ase.mep import NEB

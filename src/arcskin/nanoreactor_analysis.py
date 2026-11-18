@@ -21,6 +21,8 @@ import numpy as np
 import tqdm_pathos
 import multiprocess as mp
 import warp as wp
+
+wp.config.log_level = wp.LOG_WARNING  # no 'Warp initialized' banner (per process)
 from aimnet.calculators import AIMNet2ASE
 import warnings
 
@@ -39,7 +41,7 @@ def _get_calc():
     if _calc is None:
         import warp as wp
 
-        wp.config.quiet = True
+        wp.config.log_level = wp.LOG_WARNING
         import torch
 
         torch.set_num_threads(1)
@@ -103,7 +105,7 @@ class AnalyseNanoReactor:
         self.trajectory = defaultdict(dict)
         self.unique_structures = defaultdict(lambda: defaultdict(list))
         self.unique_smiles_counter = defaultdict(lambda: defaultdict(list))
-        wp.config.quiet = True
+        wp.config.log_level = wp.LOG_WARNING
         mp.set_start_method("spawn", force=True)
         if not calculator:
             print("calculating with default calculator: aimnet")
