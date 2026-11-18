@@ -45,8 +45,12 @@ dependencies = [
         'pandas',
         'monty',#==2024.2.26',
         'pytest',
-        'deprecated'
+        'deprecated',
+        'tinydb'
 ]
+
+[project.scripts]
+arcskin = "arcskin.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4.0", "pytest-cov>=3.0.0"]
