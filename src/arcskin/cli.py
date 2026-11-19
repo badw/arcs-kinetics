@@ -83,14 +83,18 @@ def save(db, key, **fields):
 
 
 def add_compounds(db, key, smiles, role):
-    """Record compounds and the reaction they appeared in (role: reactant/product)."""
-    table, C = db.table("compounds"), Query()
-    for s in sorted({canon(x) for x in smiles}):
-        doc = dict(table.get(C.smiles == s) or
-                   {"smiles": s, "reactant_in": [], "product_in": []})
+    """Record compounds and the reaction they appeared in (role: reactant/product).
+    One record per molecule (matched by connectivity, so O=N=O and [O]N=O are
+    the same), keeping the spelling it was first seen with."""
+    table = db.table("compounds")
+    by_skel = {skeleton(c["smiles"]): c for c in table.all()}
+    for s in sorted(set(smiles)):
+        sk = skeleton(s)
+        doc = dict(by_skel.get(sk) or {"smiles": s, "reactant_in": [], "product_in": []})
         if key not in doc[f"{role}_in"]:
             doc[f"{role}_in"].append(key)
-        table.upsert(doc, C.smiles == s)
+        table.upsert(doc, Query().smiles == doc["smiles"])
+        by_skel[sk] = doc
 
 
 def best_pathways(ranking, ea_tol):
@@ -303,9 +307,6 @@ def run_pipeline(args, db, key, directory, suggest=True):
     counts = dict(anr.unique_smiles_counter)
     log(f"{len(counts)} unique species observed")
     table(sorted(counts.items(), key=lambda kv: -kv[1]), ["species", "count"])
-    for v in (possible_paths or {}).values():
-        add_compounds(db, key, v["products"], "product")
-
     tier = getattr(args, "focus", None)
     if not possible_paths:
         log("no sensible pathways found")
@@ -331,6 +332,9 @@ def run_pipeline(args, db, key, directory, suggest=True):
         save(db, key, deferred=deferred)
 
     best = (get_entry(db, key) or {}).get("best_pathways") or []
+    for b in best:  # only what NEB says is the outcome, not every candidate
+        if b.get("sane"):
+            add_compounds(db, key, b["products"], "product")
     save(db, key, status="complete")
 
     # summary
@@ -507,17 +511,22 @@ def skeleton(smi):
     return Chem.MolToSmiles(mol)
 
 
-def all_steps(db, max_ea):
+def all_steps(db, max_ea, keep="best", ea_tol=0.1):
     """Every NEB pathway in the database, each with `problem` set to why it
-    can't be used ('' if it can)."""
+    can't be used ('' if it can).
+
+    keep: which usable pathways of each pair run go into the search
+      "best" - only the lowest-Ea one (the dominant channel)
+      "tol"  - the lowest-Ea one plus any within ea_tol eV of it
+      "all"  - every sane pathway with Ea <= max_ea"""
     steps = []
     for e in db.all():
         if e.get("status") != "complete":
             continue
         for r in e.get("neb") or []:
             st = {"source": e["key"], "pathway": r.get("pathway"),
-                  "reactants": [canon(x) for x in r.get("reactants") or []],
-                  "products": [canon(x) for x in r.get("products") or []],
+                  "reactants": list(r.get("reactants") or []),
+                  "products": list(r.get("products") or []),
                   "Ea": None, "dE": r.get("dE"), "kind": r.get("kind", ""),
                   "problem": ""}
             try:
@@ -536,19 +545,35 @@ def all_steps(db, max_ea):
                 except ValueError as err:
                     st["problem"] = str(err)
             steps.append(st)
+    if keep != "all":
+        groups = {}
+        for st in steps:
+            if not st["problem"]:
+                groups.setdefault((st["source"], pair_skeleton(st["reactants"])),
+                                  []).append(st)
+        for grp in groups.values():
+            low = min(st["Ea"] for st in grp)
+            first = True
+            for st in sorted(grp, key=lambda st: st["Ea"]):
+                if keep == "best" and not first:
+                    st["problem"] = f"not the best of its run (best Ea {low:.3f})"
+                elif keep == "tol" and st["Ea"] > low + ea_tol:
+                    st["problem"] = (f"more than {ea_tol} eV above the best of "
+                                     f"its run ({low:.3f})")
+                first = False
     return sorted(steps, key=lambda st: (st["Ea"] is None, st["Ea"] or 0))
 
 
-def reasonable_steps(db, max_ea):
-    """Every sane, atom-balanced NEB pathway in the database with Ea <= max_ea."""
-    return [st for st in all_steps(db, max_ea) if not st["problem"]]
+def reasonable_steps(db, max_ea, keep="best", ea_tol=0.1):
+    """The NEB pathways a network search may use (see all_steps)."""
+    return [st for st in all_steps(db, max_ea, keep, ea_tol) if not st["problem"]]
 
 
-def print_step_report(db, max_ea, states, name):
+def print_step_report(db, max_ea, states, name, keep="best", ea_tol=0.1):
     """Why each step in the database was or wasn't usable."""
     reached = {k for sk in states for k, _ in sk}
     rows = []
-    for st in all_steps(db, max_ea):
+    for st in all_steps(db, max_ea, keep, ea_tol):
         why = st["problem"]
         if not why:
             need = Counter(skeleton(x) for x in st["reactants"])
@@ -794,6 +819,8 @@ def cmd_network(args):
         print(f"  flask     : {fmt_flask(_fkey(start), name)}"
               + (f"  (overall x {args.scale})" if args.scale > 1 else ""))
         print(f"  criteria  : sane NEB pathway with Ea <= {args.max_ea} eV; "
+              f"steps kept per pair run: {args.steps}"
+              + (f" (within {args.ea_tol} eV)" if args.steps == "tol" else "") + "; "
               f"at most {args.max_runs} new pair run(s)")
         ra, pa = atom_counts(reactants), atom_counts(products)
         if ra != pa:
@@ -805,7 +832,7 @@ def cmd_network(args):
         runs, tried, route, said = 0, set(), None, set()
         while True:
             name = dict(base_name)
-            steps = flask_steps(reasonable_steps(db, args.max_ea), name)
+            steps = flask_steps(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol), name)
             for x in products:
                 name.setdefault(skeleton(x), x)
             states, truncated = explore(start, steps, args.max_states)
@@ -891,7 +918,7 @@ def cmd_network(args):
                 if args.focus:
                     pargs.focus = make_tier([a, b], depth, steps, goal, targets)
                 pair_dir = os.path.join(directory, slug(key))
-                n_before = len(reasonable_steps(db, args.max_ea))
+                n_before = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol))
                 try:
                     with contextlib.redirect_stdout(console):  # details -> pair log
                         run_pair(pargs, db, key, pair_dir, suggest=False)
@@ -901,7 +928,7 @@ def cmd_network(args):
                 entry = get_entry(db, key)
                 log(f"done -> {pair_dir}/arcskin.log")
                 print_best(entry.get("best_pathways") or [])
-                new = len(reasonable_steps(db, args.max_ea)) - n_before
+                new = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol)) - n_before
                 log(f"{new} new usable step(s)")
             if stop:
                 break
@@ -918,7 +945,7 @@ def cmd_network(args):
             print(f"  reachable species: {', '.join(sorted(name.get(k, k) for k in reached))}")
             print("  try raising --max-ea / --max-runs / --scale, or --retry-failed")
             section("steps in the database")
-            print_step_report(db, args.max_ea, states, name)
+            print_step_report(db, args.max_ea, states, name, args.steps, args.ea_tol)
             networks.upsert(jsanitize({"overall": overall, "status": "not found",
                                        "reachable": sorted(name.get(k, k) for k in reached),
                                        "updated": now()}),
@@ -1130,6 +1157,11 @@ def main(argv=None):
                    help="deepest generation to run (default 4); generation 1 = "
                    "pairs of the starting flask, 2 = pairs possible after one "
                    "step, ...")
+    w.add_argument("--steps", choices=["best", "tol", "all"], default="best",
+                   help="which usable NEB pathways of each pair run the search "
+                   "may use: best = only the lowest-Ea one (default), tol = also "
+                   "those within --ea-tol of it, all = every sane one with "
+                   "Ea <= --max-ea")
     w.add_argument("--no-focus", dest="focus", action="store_false",
                    help="NEB every candidate pathway of each pair, instead of "
                    "the ones that complete the reaction first")
