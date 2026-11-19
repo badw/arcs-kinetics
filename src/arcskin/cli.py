@@ -893,7 +893,16 @@ def proposals(db, depth, goal, name, model):
     return out
 
 
-def run_proposal(args, db, reac, prod, sig, directory):
+def reaction_slug(reactants, products):
+    """Filename-safe name for an overall reaction, e.g.
+    2 [N]=O + O=O -> 2 O=[N+][O-]  ->  2N_O+O_O_to_2O_N_O"""
+    def side(smiles):
+        return "+".join(f"{n if n > 1 else ''}{slug(x) or 'X'}"
+                        for x, n in Counter(smiles).items())
+    return f"{side(reactants)}_to_{side(products)}"
+
+
+def run_proposal(args, db, reac, prod, sig, directory, tag="proposed"):
     """NEB one proposed step and store it in the 'proposals' table."""
     from arcskin.nanoreactor_analysis import AnalyseNanoReactor
 
@@ -906,7 +915,7 @@ def run_proposal(args, db, reac, prod, sig, directory):
     pdir = os.path.join(directory, "proposed")
     os.makedirs(pdir, exist_ok=True)
     rec = None
-    with run_log(os.path.join(pdir, "proposed.log")):
+    with run_log(os.path.join(pdir, f"{tag}.log")):
         banner(f"proposed step: {fmt_rxn(reac, prod)}")
         recs = neb_records(args, {0: path})
         rec = jsanitize(recs[0], strict=False) if recs else None
@@ -1035,7 +1044,8 @@ def cmd_network(args):
                         log(f"NEB {fmt_rxn(reac, prod)}")
                         try:
                             with contextlib.redirect_stdout(console):
-                                rec = run_proposal(args, db, reac, prod, sig, directory)
+                                rec = run_proposal(args, db, reac, prod, sig, directory,
+                                                   reaction_slug(reactants, products))
                         except Exception as e:
                             log(f"FAILED: {e}")
                             db.table("proposals").upsert(
