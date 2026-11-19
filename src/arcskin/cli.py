@@ -202,6 +202,20 @@ def neb_pathways(args, db, key, paths):
     entry's existing NEB records and best pathways. Returns the new records."""
     import pandas as pd
 
+    new = neb_records(args, paths)
+    if not new:
+        return []
+    done = {str(r["pathway"]) for r in new}
+    old = [r for r in (get_entry(db, key) or {}).get("neb") or []
+           if str(r.get("pathway")) not in done]
+    merged = old + jsanitize(new, strict=False)
+    best = best_pathways(pd.DataFrame(merged), args.ea_tol)
+    save(db, key, neb=merged, best_pathways=best)
+    return new
+
+
+def neb_records(args, paths):
+    """Endpoints + NEB for `paths` ({id: pathway}); returns the NEB records."""
     from arcskin.make_neb_endpoints import make_endpoints
     from arcskin.run_neb import run_all
 
@@ -227,13 +241,6 @@ def neb_pathways(args, db, key, paths):
             r.get("kind"), r.get("reason") or "")
            for _, r in ranking.sort_values("Ea").iterrows()],
           ["#", "pathway", "Ea/eV", "dE/eV", "mult", "sane", "kind", "note"])
-
-    done = {str(r["pathway"]) for r in new}
-    old = [r for r in (get_entry(db, key) or {}).get("neb") or []
-           if str(r.get("pathway")) not in done]
-    merged = old + jsanitize(new, strict=False)
-    best = best_pathways(pd.DataFrame(merged), args.ea_tol)
-    save(db, key, neb=merged, best_pathways=best)
     return new
 
 
@@ -561,7 +568,10 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None):
       "tol"  - the lowest-Ea one plus any within ea_tol eV of it
       "all"  - every sane pathway with Ea <= max_ea"""
     steps = []
-    for e in db.all():
+    proposals = [{"key": f"proposed:{d['key']}", "status": "complete",
+                  "model": d.get("model"), "neb": [d["neb"]] if d.get("neb") else []}
+                 for d in db.table("proposals").all()]
+    for e in db.all() + proposals:
         if e.get("status") != "complete":
             continue
         other = model and entry_model(e) != model
@@ -841,6 +851,73 @@ def make_tier(pair, depth, steps, goal, targets, max_states=2000):
     return tier
 
 
+def proposal_sig(reactants, products):
+    return f"{'.'.join(sorted(map(skeleton, reactants)))}>>" \
+           f"{'.'.join(sorted(map(skeleton, products)))}"
+
+
+def proposals(db, depth, goal, name, model):
+    """Steps suggested by the overall equation: A + B -> (exactly what is still
+    missing), for every pair A + B that can meet in a reachable flask where
+    turning A + B into the missing products completes the reaction. Each is
+    one NEB, much cheaper than a nanoreactor run, and catches steps the short
+    MD never sampled (e.g. N2O2 + O2 -> 2 NO2). Already-tried ones are skipped.
+    Returns [(depth, reactants, products, sig)] shallowest first."""
+    done = {(d["sig"], d.get("model")) for d in db.table("proposals").all()}
+    out, seen = [], set()
+    for sk, d in sorted(depth.items(), key=lambda kv: kv[1]):
+        flask = Counter(dict(sk))
+        if all(flask.get(k, 0) >= v for k, v in goal.items()):
+            continue
+        for a, b in itertools.combinations_with_replacement(sorted(flask), 2):
+            if a == b and flask[a] < 2:
+                continue
+            rest = flask - Counter([a, b])
+            if any(v > goal.get(k, 0) for k, v in rest.items()):
+                continue  # leftovers that aren't products: wouldn't finish
+            need = goal - rest
+            reac = [name[a], name[b]]
+            prod = [name[k] for k, v in sorted(need.items()) for _ in range(v)]
+            if not prod or Counter([a, b]) == need:
+                continue
+            try:
+                if atom_counts(reac) != atom_counts(prod):
+                    continue
+            except ValueError:
+                continue
+            sig = proposal_sig(reac, prod)
+            if sig in seen or (sig, model) in done:
+                continue
+            seen.add(sig)
+            out.append((d, reac, prod, sig))
+    return out
+
+
+def run_proposal(args, db, reac, prod, sig, directory):
+    """NEB one proposed step and store it in the 'proposals' table."""
+    from arcskin.nanoreactor_analysis import AnalyseNanoReactor
+
+    anr = AnalyseNanoReactor(model=args.model)
+    path = {"reactants": reac, "products": prod, "origin": "proposed"}
+    path["reactants_energies"] = [anr.species_energy(x) for x in reac]
+    path["products_energies"] = [anr.species_energy(x) for x in prod]
+    path["diff"] = float(np.sum(path["products_energies"])
+                         - np.sum(path["reactants_energies"]))
+    pdir = os.path.join(directory, "proposed")
+    os.makedirs(pdir, exist_ok=True)
+    rec = None
+    with run_log(os.path.join(pdir, "proposed.log")):
+        banner(f"proposed step: {fmt_rxn(reac, prod)}")
+        recs = neb_records(args, {0: path})
+        rec = jsanitize(recs[0], strict=False) if recs else None
+    key = f"{reaction_key(*reac)}>>{'.'.join(sorted(canon(x) for x in prod))}"
+    db.table("proposals").upsert(
+        {"sig": sig, "key": key, "model": args.model, "reactants": reac,
+         "products": prod, "neb": rec, "updated": now()},
+        (Query().sig == sig) & (Query().model == args.model))
+    return rec
+
+
 def deferred_candidates(db, pairs, model=None):
     """[(generation, key, [ids])] for entries with deferred pathways whose pair
     can meet in a reachable flask, lowest generation first."""
@@ -950,6 +1027,28 @@ def cmd_network(args):
             elif len(have) == len(targets):
                 log("targets can be made, but not all from the available "
                     "amounts at once; continuing")
+            if args.propose:
+                props = proposals(db, depth, goal, name, args.model)
+                if props:
+                    banner(f"proposed steps from the overall equation: {len(props)}", "-")
+                    for _, reac, prod, sig in props:
+                        log(f"NEB {fmt_rxn(reac, prod)}")
+                        try:
+                            with contextlib.redirect_stdout(console):
+                                rec = run_proposal(args, db, reac, prod, sig, directory)
+                        except Exception as e:
+                            log(f"FAILED: {e}")
+                            db.table("proposals").upsert(
+                                {"sig": sig, "key": sig, "model": args.model,
+                                 "reactants": reac, "products": prod, "neb": None,
+                                 "error": str(e), "updated": now()},
+                                (Query().sig == sig) & (Query().model == args.model))
+                            continue
+                        if rec:
+                            log(f"  Ea={fnum(rec.get('Ea'))} dE={fnum(rec.get('dE'))} "
+                                f"{rec.get('kind')}" + ("" if rec.get("sane")
+                                                        else f" ({rec.get('reason')})"))
+                    continue  # re-explore with whatever the proposals gave
             fp = flask_pairs(states, depth, goal)
             cands = candidate_pairs(db, fp, name, tried, args.retry_failed,
                                     None if args.any_model else args.model)
@@ -1283,6 +1382,9 @@ def main(argv=None):
                    help="deepest generation to run (default 4); generation 1 = "
                    "pairs of the starting flask, 2 = pairs possible after one "
                    "step, ...")
+    w.add_argument("--no-propose", dest="propose", action="store_false",
+                   help="don't NEB steps suggested by the overall equation "
+                   "(A + B -> exactly the missing products) before nanoreactor runs")
     w.add_argument("--weak-max", type=float, default=0.15,
                    help="use unbound/weakly bound complexes A + B -> C (NO dimer, "
                    "ONOO, ...) as fast pre-equilibrium steps if C is at most this "
