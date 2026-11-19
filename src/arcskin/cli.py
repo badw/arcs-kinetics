@@ -29,6 +29,8 @@ import os
 import re
 import sys
 import traceback
+
+import numpy as np
 from collections import Counter
 
 from monty.json import jsanitize
@@ -525,9 +527,34 @@ def skeleton(smi):
     return Chem.MolToSmiles(mol)
 
 
-def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None):
+def weak_complex(r, weak_max):
+    """Binding energy (eV, from the isolated species) if NEB record `r` is a
+    weakly bound association A + B -> C, else None.
+
+    C must be a single molecule that the NEB found unbound (it fell apart into
+    A + B when relaxed) and must lie no more than weak_max eV above A + B.
+    Such complexes (the NO dimer, ONOO, ...) aren't minima at this level but
+    are the pre-equilibria that termolecular reactions like 2 NO + O2 run
+    through, so a search may treat them as fast, reversible steps."""
+    if weak_max is None or r.get("kind") != "unbound":
+        return None
+    if len(r.get("reactants") or []) != 2 or len(r.get("products") or []) != 1:
+        return None
+    try:
+        diff = float(r.get("diff"))
+    except (TypeError, ValueError):
+        return None
+    return diff if np.isfinite(diff) and diff <= weak_max else None
+
+
+def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None):
     """Every NEB pathway in the database, each with `problem` set to why it
     can't be used ('' if it can).
+
+    weak_max: if set, unbound associations A + B -> C lying <= weak_max eV
+      above A + B become usable "weak complex" steps (Ea 0, dE = binding
+      energy); see weak_complex(). They are kept in addition to each run's
+      best step, not in competition with it.
 
     keep: which usable pathways of each pair run go into the search
       "best" - only the lowest-Ea one (the dominant channel)
@@ -548,8 +575,11 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None):
                 st["Ea"] = float(r["Ea"])
             except (TypeError, ValueError, KeyError):
                 st["problem"] = "no Ea"
+            bind = None if other else weak_complex(r, weak_max)
             if other:
                 st["problem"] = f"computed with {entry_model(e)}, not {model}"
+            elif bind is not None:
+                st.update(Ea=0.0, dE=bind, kind="weak complex", problem="")
             elif not st["problem"] and not r.get("sane"):
                 st["problem"] = f"not sane ({r.get('kind') or 'old check'})"
             elif not st["problem"] and st["Ea"] > max_ea:
@@ -565,7 +595,7 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None):
     if keep != "all":
         groups = {}
         for st in steps:
-            if not st["problem"]:
+            if not st["problem"] and st["kind"] != "weak complex":
                 groups.setdefault((st["source"], pair_skeleton(st["reactants"])),
                                   []).append(st)
         for grp in groups.values():
@@ -581,17 +611,18 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None):
     return sorted(steps, key=lambda st: (st["Ea"] is None, st["Ea"] or 0))
 
 
-def reasonable_steps(db, max_ea, keep="best", ea_tol=0.1, model=None):
+def reasonable_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None):
     """The NEB pathways a network search may use (see all_steps)."""
-    return [st for st in all_steps(db, max_ea, keep, ea_tol, model)
+    return [st for st in all_steps(db, max_ea, keep, ea_tol, model, weak_max)
             if not st["problem"]]
 
 
-def print_step_report(db, max_ea, states, name, keep="best", ea_tol=0.1, model=None):
+def print_step_report(db, max_ea, states, name, keep="best", ea_tol=0.1, model=None,
+                      weak_max=None):
     """Why each step in the database was or wasn't usable."""
     reached = {k for sk in states for k, _ in sk}
     rows = []
-    for st in all_steps(db, max_ea, keep, ea_tol, model):
+    for st in all_steps(db, max_ea, keep, ea_tol, model, weak_max):
         why = st["problem"]
         if not why:
             need = Counter(skeleton(x) for x in st["reactants"])
@@ -600,6 +631,8 @@ def print_step_report(db, max_ea, states, name, keep="best", ea_tol=0.1, model=N
                 missing = [name.get(k, k) for k in need if k not in reached]
                 why = ("needs " + ", ".join(missing) if missing
                        else "reactants never together in the flask")
+        if not why and st["kind"] == "weak complex":
+            why = f"usable (weak complex, {st['dE']:+.3f} eV)"
         rows.append((fmt_rxn(st["reactants"], st["products"]), fnum(st["Ea"]),
                      st["source"], why or "usable"))
     if rows:
@@ -847,6 +880,7 @@ def cmd_network(args):
     console = sys.stdout
     networks, N = db.table("networks"), Query()
     use_model = None if args.any_model else args.model
+    weak_max = None if args.weak_max < 0 else args.weak_max
 
     # skeleton -> SMILES used to run/show a species: your reactants as written,
     # otherwise the nanoreactor's own spelling (so the analysis recognises it),
@@ -870,6 +904,9 @@ def cmd_network(args):
               + (f"  (overall x {args.scale})" if args.scale > 1 else ""))
         print(f"  model     : {args.model}"
               + ("  (also using results from other models)" if args.any_model else ""))
+        print("  complexes : " + (f"weakly bound associations within {weak_max} eV "
+                                  "of their parts used as fast pre-equilibria"
+                                  if weak_max is not None else "not used"))
         print(f"  criteria  : sane NEB pathway with Ea <= {args.max_ea} eV; "
               f"steps kept per pair run: {args.steps}"
               + (f" (within {args.ea_tol} eV)" if args.steps == "tol" else "") + "; "
@@ -884,7 +921,7 @@ def cmd_network(args):
         runs, tried, route, said = 0, set(), None, set()
         while True:
             name = dict(base_name)
-            steps = flask_steps(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model), name)
+            steps = flask_steps(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model, weak_max), name)
             for x in products:
                 name.setdefault(skeleton(x), x)
             states, truncated = explore(start, steps, args.max_states)
@@ -971,7 +1008,7 @@ def cmd_network(args):
                 if args.focus:
                     pargs.focus = make_tier([a, b], depth, steps, goal, targets)
                 pair_dir = os.path.join(directory, pair_dirname(key))
-                n_before = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model))
+                n_before = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model, weak_max))
                 try:
                     with contextlib.redirect_stdout(console):  # details -> pair log
                         run_pair(pargs, db, key, pair_dir, suggest=False)
@@ -981,7 +1018,7 @@ def cmd_network(args):
                 entry = get_entry(db, key)
                 log(f"done -> {pair_dir}/arcskin.log")
                 print_best(entry.get("best_pathways") or [])
-                new = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model)) - n_before
+                new = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model, weak_max)) - n_before
                 log(f"{new} new usable step(s)")
             if stop:
                 break
@@ -999,7 +1036,7 @@ def cmd_network(args):
             print("  try raising --max-ea / --max-runs / --scale, or --retry-failed")
             section("steps in the database")
             print_step_report(db, args.max_ea, states, name, args.steps, args.ea_tol,
-                              use_model)
+                              use_model, weak_max)
             networks.upsert(jsanitize({"overall": overall, "status": "not found",
                                        "reachable": sorted(name.get(k, k) for k in reached),
                                        "updated": now()}),
@@ -1023,6 +1060,32 @@ def cmd_network(args):
                     flask = (flask - Counter(skeleton(x) for x in st["reactants"])
                              + Counter(skeleton(x) for x in st["products"]))
                 print(f"    after {i + 1:<3d} : {fmt_flask(_fkey(flask), name)}")
+            # energy profile: where each step starts (sum of earlier dE) and the
+            # highest point it reaches, relative to the starting flask
+            e_now, peak, peak_step = 0.0, 0.0, None
+            for i, (m, st) in enumerate(grouped):
+                for _ in range(m):
+                    top = e_now + st["Ea"]
+                    if top > peak or peak_step is None:
+                        peak, peak_step = max(peak, top), i + 1
+                    try:
+                        e_now += float(st["dE"])
+                    except (TypeError, ValueError):
+                        pass
+            if any(st["kind"] == "weak complex" for _, st in grouped):
+                print("\n  energy profile (relative to the start, sum of dE):")
+                e_now = 0.0
+                for i, (m, st) in enumerate(grouped):
+                    for _ in range(m):
+                        top = e_now + st["Ea"]
+                        try:
+                            e_now += float(st["dE"])
+                        except (TypeError, ValueError):
+                            pass
+                    print(f"    step {i + 1:<3d}: highest point {top:+.3f} eV, "
+                          f"then {e_now:+.3f} eV")
+                print(f"  apparent barrier   : {peak:+.3f} eV (step {peak_step}; "
+                      "includes uphill pre-equilibria)")
             print(f"\n  rate-limiting step : {fmt_rxn(rls['reactants'], rls['products'])}"
                   f"  (Ea = {rls['Ea']:.3f} eV)")
             networks.upsert(jsanitize({"overall": overall, "status": "found",
@@ -1220,6 +1283,10 @@ def main(argv=None):
                    help="deepest generation to run (default 4); generation 1 = "
                    "pairs of the starting flask, 2 = pairs possible after one "
                    "step, ...")
+    w.add_argument("--weak-max", type=float, default=0.15,
+                   help="use unbound/weakly bound complexes A + B -> C (NO dimer, "
+                   "ONOO, ...) as fast pre-equilibrium steps if C is at most this "
+                   "many eV above A + B (default 0.15; negative = don't)")
     w.add_argument("--steps", choices=["best", "tol", "all"], default="best",
                    help="which usable NEB pathways of each pair run the search "
                    "may use: best = only the lowest-Ea one (default), tol = also "
