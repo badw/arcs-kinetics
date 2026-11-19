@@ -362,9 +362,16 @@ def cmd_run(args):
     db = TinyDB(args.db)
     key = reaction_key(args.smiles1, args.smiles2)
     entry = get_entry(db, key)
+    if not entry:  # same molecules, different SMILES spelling?
+        key2, st = run_status(db).get(pair_skeleton([args.smiles1, args.smiles2]),
+                                      (None, None))
+        if key2 and st == "complete":
+            entry = get_entry(db, key2)
+            print(f"note: same pair already run as {key2}")
     if entry and entry.get("status") == "complete" and not args.force:
         print_best(entry.get("best_pathways", []))
-        sys.exit(f"error: {key} has already been run (in {args.db}); use --force to rerun")
+        sys.exit(f"error: {entry['key']} has already been run (in {args.db}); "
+                 f"use --force to rerun")
     run_pair(args, db, key, args.dir or slug(key))
 
 
@@ -565,37 +572,76 @@ def route_to(states, sk):
     return out[::-1]
 
 
-def flask_pairs(states, goal=None):
-    """{(a, b): (cost, state)} for every pair that can meet in some reachable
-    flask (a == b needs two of them), with the cheapest such state. Flasks that
-    already hold `goal` are skipped (nothing left to make)."""
+def flask_depths(start, states, steps):
+    """Fewest steps from `start` to each explored flask state (BFS)."""
+    from collections import deque
+
+    s0 = _fkey(start)
+    depth, queue = {s0: 0}, deque([s0])
+    while queue:
+        sk = queue.popleft()
+        flask = Counter(dict(sk))
+        for r, p, _ in steps:
+            if any(flask[x] < v for x, v in r.items()):
+                continue
+            nk = _fkey(flask - r + p)
+            if nk in states and nk not in depth:
+                depth[nk] = depth[sk] + 1
+                queue.append(nk)
+    return depth
+
+
+def flask_pairs(states, depth, goal=None):
+    """{(a, b): (generation, state)} for every pair that can meet in some
+    reachable flask (a == b needs two of them). generation = 1 + fewest steps
+    needed before they can meet, so generation 1 = pairs of the starting flask.
+    Flasks that already hold `goal` are skipped (nothing left to make)."""
     pairs = {}
-    for sk, (cost, _, _) in states.items():
+    for sk, d in depth.items():
         flask = dict(sk)
         if goal and all(flask.get(k, 0) >= v for k, v in goal.items()):
             continue
         for a, b in itertools.combinations_with_replacement(sorted(flask), 2):
             if a == b and flask[a] < 2:
                 continue
-            if (a, b) not in pairs or cost < pairs[(a, b)][0]:
-                pairs[(a, b)] = (cost, sk)
-    return pairs
+            g = (d + 1, states[sk][0])
+            if (a, b) not in pairs or g < pairs[(a, b)][:2]:
+                pairs[(a, b)] = (d + 1, states[sk][0], sk)
+    return {k: (g, sk) for k, (g, _, sk) in pairs.items()}
+
+
+def pair_skeleton(smiles):
+    return tuple(sorted(skeleton(x) for x in smiles))
+
+
+def run_status(db):
+    """{skeleton pair: (key, status)}: one entry per pair, however it was spelt."""
+    out = {}
+    for e in db.all():
+        smiles = e.get("smiles") or e["key"].split(".")
+        sk = pair_skeleton(smiles)
+        st = e.get("status", "")
+        if sk not in out or st == "complete":
+            out[sk] = (e["key"], st)
+    return out
 
 
 def candidate_pairs(db, pairs, name, tried, retry_failed=False):
-    """Untried pairs from flask_pairs, cheapest flask first, A+B before A+A."""
-    status = {e["key"]: e.get("status", "") for e in db.all()}
+    """Untried pairs as (generation, smiles1, smiles2, key, state), lowest
+    generation first, A+B before A+A. A pair counts as run whatever SMILES it
+    was run with (O=N=O + X is the same pair as O=[N+][O-] + X)."""
+    status = run_status(db)
     out = []
-    for (a, b), (cost, sk) in pairs.items():
+    for (a, b), (gen, sk) in pairs.items():
         sa, sb = name[a], name[b]
         key = reaction_key(sa, sb)
-        st = status.get(key)
-        if key in tried or st == "complete" or st == "running":
+        _, st = status.get((a, b) if a <= b else (b, a), (None, None))
+        if key in tried or (a, b) in tried or st in ("complete", "running"):
             continue
         if st and st.startswith("failed") and not retry_failed:
             continue
-        out.append(((cost[1], cost[0], a == b, key), sa, sb, key, sk))
-    return [(sa, sb, key, sk) for _, sa, sb, key, sk in sorted(out)]
+        out.append(((gen, a == b, key), gen, sa, sb, key, sk))
+    return [c[1:] for c in sorted(out)]
 
 
 def fmt_flask(sk, name):
@@ -621,9 +667,13 @@ def cmd_network(args):
     console = sys.stdout
     networks, N = db.table("networks"), Query()
 
-    name = {}  # skeleton -> SMILES shown/run (user's spelling wins)
-    for x in reactants + products:
-        name.setdefault(skeleton(x), x)
+    # skeleton -> SMILES used to run/show a species: your reactants as written,
+    # otherwise the nanoreactor's own spelling (so the analysis recognises it),
+    # with your product spelling only as a fallback
+    base_name = {}
+    for x in reactants:
+        base_name.setdefault(skeleton(x), x)
+    name = dict(base_name)
     start = Counter({k: v * args.scale for k, v in
                      Counter(skeleton(x) for x in reactants).items()})
     goal = Counter({k: v * args.scale for k, v in
@@ -646,16 +696,24 @@ def cmd_network(args):
         if not targets:
             sys.exit("error: nothing to make (all products are also reactants)")
 
-        runs, tried, route = 0, set(), None
+        runs, tried, route, said = 0, set(), None, set()
         while True:
+            name = dict(base_name)
             steps = flask_steps(reasonable_steps(db, args.max_ea), name)
+            for x in products:
+                name.setdefault(skeleton(x), x)
             states, truncated = explore(start, steps, args.max_states)
             if truncated:
                 log(f"WARNING: stopped exploring at --max-states ({args.max_states})")
+            depth = flask_depths(start, states, steps)
             done = [sk for sk in states
                     if all(dict(sk).get(k, 0) >= v for k, v in goal.items())]
             reached = {k for sk in states for k, _ in sk}
             have = [t for t in targets if skeleton(t) in reached]
+            for t in have:
+                if name[skeleton(t)] != t and t not in said:
+                    said.add(t)
+                    log(f"target {t} found as {name[skeleton(t)]} (same molecule)")
             log(f"{len(steps)} usable step(s); {len(states)} flask state(s), "
                 f"{len(reached)} species reachable; targets reached: "
                 f"{len(have)}/{len(targets)}")
@@ -670,36 +728,48 @@ def cmd_network(args):
             elif len(have) == len(targets):
                 log("targets can be made, but not all from the available "
                     "amounts at once; continuing")
-            cands = candidate_pairs(db, flask_pairs(states, goal), name, tried,
-                                    args.retry_failed)
+            cands = candidate_pairs(db, flask_pairs(states, depth, goal), name,
+                                    tried, args.retry_failed)
             if not cands:
                 log("no untried pairs left")
                 break
-            if runs >= args.max_runs:
-                log(f"reached --max-runs ({args.max_runs}); "
-                    f"{len(cands)} pair(s) still untried")
+            gen = cands[0][0]
+            if gen > args.max_generations:
+                log(f"next pairs are generation {gen} > --max-generations "
+                    f"({args.max_generations}); stopping")
                 break
-            a, b, key, sk = cands[0]
-            runs += 1
-            tried.add(key)
-            section(f"run {runs}/{args.max_runs}: {a} + {b}  "
-                    f"({len(cands) - 1} more queued)")
-            log(f"possible once the flask holds: {fmt_flask(sk, name)}")
-            pargs = argparse.Namespace(**vars(args))
-            pargs.smiles1, pargs.smiles2, pargs.dir = a, b, None
-            pair_dir = os.path.join(directory, slug(key))
-            n_before = len(steps)
-            try:
-                with contextlib.redirect_stdout(console):  # details -> pair log only
-                    run_pair(pargs, db, key, pair_dir, suggest=False)
-            except Exception as e:
-                log(f"FAILED: {e}  (see {pair_dir}/arcskin.log)")
-                continue
-            entry = get_entry(db, key)
-            log(f"done -> {pair_dir}/arcskin.log")
-            print_best(entry.get("best_pathways") or [])
-            new = len(flask_steps(reasonable_steps(db, args.max_ea), {})) - n_before
-            log(f"{new} new usable step(s)")
+            batch = [c for c in cands if c[0] == gen]
+            banner(f"generation {gen}: {len(batch)} pair(s)", "-")
+            for _, a, b, _, sk in batch:
+                print(f"  {a} + {b}" + (f"    (from flask {fmt_flask(sk, name)})"
+                                       if gen > 1 else ""))
+            stop = False
+            for i, (_, a, b, key, sk) in enumerate(batch):
+                if runs >= args.max_runs:
+                    log(f"reached --max-runs ({args.max_runs}); "
+                        f"{len(batch) - i} pair(s) of generation {gen} not run")
+                    stop = True
+                    break
+                runs += 1
+                tried.update({key, pair_skeleton([a, b])})
+                section(f"gen {gen}, run {runs}/{args.max_runs}: {a} + {b}")
+                pargs = argparse.Namespace(**vars(args))
+                pargs.smiles1, pargs.smiles2, pargs.dir = a, b, None
+                pair_dir = os.path.join(directory, slug(key))
+                n_before = len(reasonable_steps(db, args.max_ea))
+                try:
+                    with contextlib.redirect_stdout(console):  # details -> pair log
+                        run_pair(pargs, db, key, pair_dir, suggest=False)
+                except Exception as e:
+                    log(f"FAILED: {e}  (see {pair_dir}/arcskin.log)")
+                    continue
+                entry = get_entry(db, key)
+                log(f"done -> {pair_dir}/arcskin.log")
+                print_best(entry.get("best_pathways") or [])
+                new = len(reasonable_steps(db, args.max_ea)) - n_before
+                log(f"{new} new usable step(s)")
+            if stop:
+                break
 
         banner("result")
         print(f"  finished  : {now()}  ({runs} new pair run(s))")
@@ -828,6 +898,10 @@ def main(argv=None):
                    "(default 1, i.e. exactly what the equation says)")
     w.add_argument("--max-states", type=int, default=20000,
                    help="cap on flask states explored (default 20000)")
+    w.add_argument("--max-generations", type=int, default=4,
+                   help="deepest generation to run (default 4); generation 1 = "
+                   "pairs of the starting flask, 2 = pairs possible after one "
+                   "step, ...")
     w.add_argument("--best", action="store_true",
                    help="don't stop at the first mechanism found: run pairs "
                    "until --max-runs / none left, then report the one with the "
