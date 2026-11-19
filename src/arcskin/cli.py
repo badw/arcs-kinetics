@@ -38,14 +38,34 @@ from tinydb import Query, TinyDB
 RDLogger.DisableLog("rdApp.warning")
 
 
+def loose_mol(smi):
+    """Parse without sanitising, so OpenBabel-style SMILES such as O=N=O or
+    N#N=O are read as written (no valence errors, no H silently added)."""
+    mol = Chem.MolFromSmiles(smi, sanitize=False)
+    if mol is not None:
+        mol.UpdatePropertyCache(strict=False)
+    return mol
+
+
+def _composition(mol):
+    c = Counter(a.GetSymbol() for a in mol.GetAtoms())
+    c["H"] += sum(a.GetTotalNumHs() for a in mol.GetAtoms())
+    return +c
+
+
 def canon(smi, strict=False):
-    """RDKit canonical SMILES (returns the input unchanged if unparsable)."""
+    """Canonical SMILES. Uses RDKit's sanitised form when that keeps the same
+    atoms; otherwise (hypervalent OpenBabel output, or RDKit would add H) a
+    canonical form of the molecule exactly as written."""
     mol = Chem.MolFromSmiles(smi)
-    if mol is None:
+    loose = loose_mol(smi)
+    if loose is None:
         if strict:
             raise ValueError(f"RDKit could not parse SMILES: {smi!r}")
         return smi
-    return Chem.MolToSmiles(mol)
+    if mol is not None and _composition(mol) == _composition(loose):
+        return Chem.MolToSmiles(mol)
+    return Chem.MolToSmiles(loose)
 
 
 def reaction_key(smi1, smi2):
@@ -393,18 +413,21 @@ def parse_reaction(text):
 
 
 def atom_counts(smiles):
+    """Element counts (H included) plus total charge, as written."""
     c = Counter()
     for smi in smiles:
-        mol = Chem.AddHs(Chem.MolFromSmiles(smi))
-        c.update(a.GetSymbol() for a in mol.GetAtoms())
-        c["charge"] += Chem.GetFormalCharge(mol)
+        mol = loose_mol(smi)
+        if mol is None:
+            raise ValueError(f"RDKit could not parse SMILES: {smi!r}")
+        c.update(_composition(mol))
+        c["charge"] += sum(a.GetFormalCharge() for a in mol.GetAtoms())
     return +c
 
 
 def skeleton(smi):
     """Connectivity-only key (all-H graph, single bonds, no charges/radicals), so
     e.g. [O]N=O and O=[N+][O-] both count as NO2."""
-    mol = Chem.MolFromSmiles(smi)
+    mol = loose_mol(smi)
     if mol is None:
         return smi
     mol = Chem.RWMol(Chem.AddHs(mol))
@@ -419,25 +442,62 @@ def skeleton(smi):
     return Chem.MolToSmiles(mol)
 
 
-def reasonable_steps(db, max_ea):
-    """Every sane NEB pathway in the database with Ea <= max_ea."""
+def all_steps(db, max_ea):
+    """Every NEB pathway in the database, each with `problem` set to why it
+    can't be used ('' if it can)."""
     steps = []
     for e in db.all():
         if e.get("status") != "complete":
             continue
         for r in e.get("neb") or []:
+            st = {"source": e["key"], "pathway": r.get("pathway"),
+                  "reactants": [canon(x) for x in r.get("reactants") or []],
+                  "products": [canon(x) for x in r.get("products") or []],
+                  "Ea": None, "dE": r.get("dE"), "kind": r.get("kind", ""),
+                  "problem": ""}
             try:
-                ea = float(r["Ea"])
+                st["Ea"] = float(r["Ea"])
             except (TypeError, ValueError, KeyError):
-                continue
-            if r.get("sane") and ea <= max_ea:
-                steps.append({
-                    "source": e["key"], "pathway": r.get("pathway"),
-                    "reactants": [canon(x) for x in r["reactants"]],
-                    "products": [canon(x) for x in r["products"]],
-                    "Ea": ea, "dE": r.get("dE"), "kind": r.get("kind", ""),
-                })
-    return sorted(steps, key=lambda st: st["Ea"])
+                st["problem"] = "no Ea"
+            if not st["problem"] and not r.get("sane"):
+                st["problem"] = f"not sane ({r.get('kind') or 'old check'})"
+            elif not st["problem"] and st["Ea"] > max_ea:
+                st["problem"] = f"Ea > {max_ea}"
+            if not st["problem"]:
+                try:
+                    ra, pa = atom_counts(st["reactants"]), atom_counts(st["products"])
+                    if ra != pa:
+                        st["problem"] = "atoms don't balance"
+                except ValueError as err:
+                    st["problem"] = str(err)
+            steps.append(st)
+    return sorted(steps, key=lambda st: (st["Ea"] is None, st["Ea"] or 0))
+
+
+def reasonable_steps(db, max_ea):
+    """Every sane, atom-balanced NEB pathway in the database with Ea <= max_ea."""
+    return [st for st in all_steps(db, max_ea) if not st["problem"]]
+
+
+def print_step_report(db, max_ea, states, name):
+    """Why each step in the database was or wasn't usable."""
+    reached = {k for sk in states for k, _ in sk}
+    rows = []
+    for st in all_steps(db, max_ea):
+        why = st["problem"]
+        if not why:
+            need = Counter(skeleton(x) for x in st["reactants"])
+            if not any(all(dict(sk).get(k, 0) >= v for k, v in need.items())
+                       for sk in states):
+                missing = [name.get(k, k) for k in need if k not in reached]
+                why = ("needs " + ", ".join(missing) if missing
+                       else "reactants never together in the flask")
+        rows.append((fmt_rxn(st["reactants"], st["products"]), fnum(st["Ea"]),
+                     st["source"], why or "usable"))
+    if rows:
+        table(rows, ["step", "Ea/eV", "from run", "status"])
+    else:
+        print("  (no NEB results in the database)")
 
 
 # A "flask" is a multiset of molecules ({skeleton: count}), starting from the
@@ -449,13 +509,13 @@ def _fkey(c):
 
 
 def flask_steps(steps, name):
-    """(reactant Counter, product Counter, step) per distinct, atom-balanced,
-    non-trivial step (lowest Ea kept). Fills `name` {skeleton: SMILES}."""
+    """(reactant Counter, product Counter, step) per distinct, non-trivial step
+    (lowest Ea kept). Fills `name` {skeleton: SMILES}."""
     best = {}
     for st in steps:
         r = Counter(skeleton(x) for x in st["reactants"])
         p = Counter(skeleton(x) for x in st["products"])
-        if r == p or atom_counts(st["reactants"]) != atom_counts(st["products"]):
+        if r == p:
             continue
         for x in st["reactants"] + st["products"]:
             name.setdefault(skeleton(x), x)
@@ -652,6 +712,8 @@ def cmd_network(args):
                       "of them from the available amounts")
             print(f"  reachable species: {', '.join(sorted(name.get(k, k) for k in reached))}")
             print("  try raising --max-ea / --max-runs / --scale, or --retry-failed")
+            section("steps in the database")
+            print_step_report(db, args.max_ea, states, name)
             networks.upsert(jsanitize({"overall": overall, "status": "not found",
                                        "reachable": sorted(name.get(k, k) for k in reached),
                                        "updated": now()}),
