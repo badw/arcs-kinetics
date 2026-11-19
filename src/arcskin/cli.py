@@ -13,6 +13,7 @@ Every reactant and discovered product is also recorded in a `compounds` table.
     arcskin compounds
     arcskin suggest -n 10
     arcskin network "2 [N]=O + O=O -> 2 [O][N]=O"
+    arcskin batch "O=S=O" "[O]N=O" "[N]=O" "O=O" "O"
 
 Each A + B pair runs in its own SMILES1_SMILES2/ directory with a log in
 SMILES1_SMILES2/arcskin.log, whether started by `run` or `network`. `network`
@@ -180,17 +181,85 @@ def run_log(path):
             raise
 
 
+def usable(rec, max_ea):
+    """A NEB record that a network search could use as a step."""
+    try:
+        return bool(rec.get("sane")) and float(rec["Ea"]) <= max_ea
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
+def neb_pathways(args, db, key, paths):
+    """Endpoints + NEB for `paths` ({id: pathway}); merges the results into the
+    entry's existing NEB records and best pathways. Returns the new records."""
+    import pandas as pd
+
+    from arcskin.make_neb_endpoints import make_endpoints
+    from arcskin.run_neb import run_all
+
+    log(f"building NEB endpoints for {len(paths)} pathway(s)")
+    endpoints = {}
+    for k, v in paths.items():
+        try:
+            reac, prod = make_endpoints(v["reactants"], v["products"])
+            endpoints[k] = {"reactants": reac, "products": prod, "overall": v}
+            log(f"pathway {k}: ok")
+        except Exception as e:
+            log(f"pathway {k}: FAILED ({e})")
+    if not endpoints:
+        log("no endpoints could be built; skipping NEB")
+        return []
+    log(f"running NEB on {len(endpoints)} pathway(s)")
+    ranking = run_all(endpoints, n_images=args.n_images, climb=True, fmax=args.fmax)
+    ranking = ranking.reset_index(names="pathway")
+    new = ranking.to_dict("records")
+    table([(r["pathway"], fmt_rxn(r["reactants"], r["products"]),
+            fnum(r["Ea"]), fnum(r["dE"]), bool(r["sane"]),
+            r.get("kind"), r.get("reason") or "")
+           for _, r in ranking.sort_values("Ea").iterrows()],
+          ["#", "pathway", "Ea/eV", "dE/eV", "sane", "kind", "note"])
+
+    done = {str(r["pathway"]) for r in new}
+    old = [r for r in (get_entry(db, key) or {}).get("neb") or []
+           if str(r.get("pathway")) not in done]
+    merged = old + jsanitize(new, strict=False)
+    best = best_pathways(pd.DataFrame(merged), args.ea_tol)
+    save(db, key, neb=merged, best_pathways=best)
+    return new
+
+
+def neb_in_tiers(args, db, key, paths, tier):
+    """NEB `paths` tier by tier (tier(pathway) -> int, lowest first), stopping
+    after the first tier that gives a usable step. Returns the ids not run."""
+    tiers = {k: tier(v) for k, v in paths.items()}
+    left = dict(paths)
+    for t in sorted(set(tiers.values())):
+        group = {k: v for k, v in left.items() if tiers[k] == t}
+        section(f"NEB tier {t} ({TIER_NAMES.get(t, '')}): {len(group)} pathway(s)")
+        new = neb_pathways(args, db, key, group)
+        for k in group:
+            left.pop(k)
+        if any(usable(r, args.max_ea) for r in new):
+            if left:
+                log(f"usable step found; {len(left)} lower-priority pathway(s) "
+                    f"deferred (run later only if needed)")
+            break
+    return sorted(left, key=str)
+
+
+TIER_NAMES = {0: "completes the overall reaction", 1: "makes a target",
+              2: "other", 3: "not possible in this flask"}
+
+
 def run_pipeline(args, db, key, directory, suggest=True):
     # heavy imports only when actually running
-    from arcskin.make_neb_endpoints import make_endpoints
     from arcskin.nanoreactor_analysis import AnalyseNanoReactor
     from arcskin.nanoreactor_run import SMILESPack, XTBNanoReactor
-    from arcskin.run_neb import run_all
 
     t0 = datetime.datetime.now()
     smiles = [args.smiles1, args.smiles2]
     known_before = {c["smiles"] for c in db.table("compounds").all()}
-    settings = {k: v for k, v in vars(args).items() if k != "func"}
+    settings = {k: v for k, v in vars(args).items() if k not in ("func", "focus")}
 
     banner(f"ARCS-Kinetics run: {' + '.join(smiles)}")
     print(f"  started   : {now()}")
@@ -237,43 +306,32 @@ def run_pipeline(args, db, key, directory, suggest=True):
     for v in (possible_paths or {}).values():
         add_compounds(db, key, v["products"], "product")
 
-    best = []
+    tier = getattr(args, "focus", None)
     if not possible_paths:
         log("no sensible pathways found")
+        save(db, key, neb=[], best_pathways=[], deferred=[])
     else:
         log(f"{len(possible_paths)} candidate pathway(s)")
-        table([(k, fmt_rxn(v["reactants"], v["products"]))
-               for k, v in possible_paths.items()], ["#", "pathway"])
-
-        # 3. NEB endpoints
-        section(f"[3/4] NEB endpoints ({len(possible_paths)} pathway(s))")
-        endpoints = {}
-        for k, v in possible_paths.items():
-            try:
-                reac, prod = make_endpoints(v["reactants"], v["products"])
-                endpoints[k] = {"reactants": reac, "products": prod, "overall": v}
-                log(f"pathway {k}: ok")
-            except Exception as e:
-                log(f"pathway {k}: FAILED ({e})")
-
-        # 4. NEB
-        if endpoints:
-            section(f"[4/4] NEB ({len(endpoints)} pathway(s))")
-            ranking = run_all(endpoints, n_images=args.n_images, climb=True,
-                              fmax=args.fmax)
-            ranking = ranking.reset_index(names="pathway")
-            save(db, key, neb=ranking.to_dict("records"))
-            best = best_pathways(ranking, args.ea_tol)
-            log("NEB ranking:")
-            table([(r["pathway"], fmt_rxn(r["reactants"], r["products"]),
-                    fnum(r["Ea"]), fnum(r["dE"]), bool(r["sane"]),
-                    r.get("kind"), r.get("reason") or "")
-                   for _, r in ranking.sort_values("Ea").iterrows()],
-                  ["#", "pathway", "Ea/eV", "dE/eV", "sane", "kind", "note"])
+        if tier:
+            table([(k, fmt_rxn(v["reactants"], v["products"]), tier(v))
+                   for k, v in sorted(possible_paths.items(),
+                                      key=lambda kv: (tier(kv[1]), kv[0]))],
+                  ["#", "pathway", "tier"])
+            print("  tiers: " + "; ".join(f"{t} = {n}" for t, n in TIER_NAMES.items()))
         else:
-            log("no endpoints could be built; skipping NEB")
+            table([(k, fmt_rxn(v["reactants"], v["products"]))
+                   for k, v in possible_paths.items()], ["#", "pathway"])
+        save(db, key, neb=[], best_pathways=[])
+        if tier:  # network search: NEB the pathways that matter first
+            deferred = neb_in_tiers(args, db, key, possible_paths, tier)
+        else:
+            section(f"[3/4 + 4/4] NEB endpoints and NEB ({len(possible_paths)} pathway(s))")
+            neb_pathways(args, db, key, possible_paths)
+            deferred = []
+        save(db, key, deferred=deferred)
 
-    save(db, key, best_pathways=best, status="complete")
+    best = (get_entry(db, key) or {}).get("best_pathways") or []
+    save(db, key, status="complete")
 
     # summary
     all_compounds = {c["smiles"] for c in db.table("compounds").all()}
@@ -644,6 +702,54 @@ def candidate_pairs(db, pairs, name, tried, retry_failed=False):
     return [c[1:] for c in sorted(out)]
 
 
+def make_tier(pair, depth, steps, goal, targets, max_states=2000):
+    """tier(pathway) for a pair run in a network search, judged against every
+    flask in which the pair can meet: 0 = completes the overall reaction (or
+    leads to it with steps already known), 1 = makes a target, 2 = other,
+    3 = can't happen in any of those flasks."""
+    pair = Counter(skeleton(x) for x in pair)
+    flasks = [Counter(dict(sk)) for sk in depth
+              if all(dict(sk).get(k, 0) >= v for k, v in pair.items())]
+    target_sk = {skeleton(t) for t in targets}
+    holds = lambda f: all(f.get(k, 0) >= v for k, v in goal.items())  # noqa: E731
+    cache = {}
+
+    def tier(v):
+        r = Counter(skeleton(x) for x in v["reactants"])
+        p = Counter(skeleton(x) for x in v["products"])
+        k = (_fkey(r), _fkey(p))
+        if k in cache:
+            return cache[k]
+        best = 3
+        for f in flasks:
+            if any(f[x] < c for x, c in r.items()):
+                continue
+            new = f - r + p
+            if holds(new) or any(holds(Counter(dict(sk)))
+                                 for sk in explore(new, steps, max_states)[0]):
+                best = 0
+                break
+            best = min(best, 1 if target_sk & set(p) else 2)
+        cache[k] = best
+        return best
+
+    return tier
+
+
+def deferred_candidates(db, pairs):
+    """[(generation, key, [ids])] for entries with deferred pathways whose pair
+    can meet in a reachable flask, lowest generation first."""
+    out = []
+    for e in db.all():
+        ids = e.get("deferred") or []
+        if not ids or e.get("status") != "complete":
+            continue
+        a, b = sorted(skeleton(x) for x in (e.get("smiles") or e["key"].split(".")))
+        if (a, b) in pairs:
+            out.append((pairs[(a, b)][0], e["key"], ids))
+    return sorted(out)
+
+
 def fmt_flask(sk, name):
     return " + ".join(f"{v} {name.get(k, k)}" if v > 1 else name.get(k, k)
                       for k, v in sk) or "(empty)"
@@ -728,15 +834,42 @@ def cmd_network(args):
             elif len(have) == len(targets):
                 log("targets can be made, but not all from the available "
                     "amounts at once; continuing")
-            cands = candidate_pairs(db, flask_pairs(states, depth, goal), name,
-                                    tried, args.retry_failed)
-            if not cands:
-                log("no untried pairs left")
-                break
-            gen = cands[0][0]
-            if gen > args.max_generations:
-                log(f"next pairs are generation {gen} > --max-generations "
-                    f"({args.max_generations}); stopping")
+            fp = flask_pairs(states, depth, goal)
+            cands = candidate_pairs(db, fp, name, tried, args.retry_failed)
+            gen = cands[0][0] if cands else None
+            if not cands or gen > args.max_generations:
+                defer = [d for d in deferred_candidates(db, fp)
+                         if d[0] <= args.max_generations]
+                if defer and runs < args.max_runs:
+                    g, key, ids = defer[0]
+                    entry = get_entry(db, key)
+                    a, b = entry.get("smiles") or key.split(".")
+                    runs += 1
+                    section(f"deferred pathways, run {runs}/{args.max_runs}: "
+                            f"{a} + {b} ({len(ids)} pathway(s))")
+                    pair_dir = entry.get("directory") or os.path.join(directory, slug(key))
+                    paths = {i: entry["pathways"][str(i)] for i in ids
+                             if str(i) in (entry.get("pathways") or {})}
+                    pargs = argparse.Namespace(**vars(args))
+                    tier = make_tier([a, b], depth, steps, goal, targets)
+                    try:
+                        os.makedirs(pair_dir, exist_ok=True)
+                        with contextlib.redirect_stdout(console), \
+                                run_log(os.path.join(pair_dir, "arcskin.log")):
+                            banner(f"deferred NEB for {a} + {b}")
+                            left = neb_in_tiers(pargs, db, key, paths, tier)
+                        save(db, key, deferred=left)
+                        log(f"{len(paths) - len(left)} deferred pathway(s) done, "
+                            f"{len(left)} still deferred")
+                    except Exception as e:
+                        save(db, key, deferred=[])
+                        log(f"FAILED: {e}  (see {pair_dir}/arcskin.log)")
+                    continue
+                if not cands:
+                    log("no untried pairs left")
+                else:
+                    log(f"next pairs are generation {gen} > --max-generations "
+                        f"({args.max_generations}); stopping")
                 break
             batch = [c for c in cands if c[0] == gen]
             banner(f"generation {gen}: {len(batch)} pair(s)", "-")
@@ -755,6 +888,8 @@ def cmd_network(args):
                 section(f"gen {gen}, run {runs}/{args.max_runs}: {a} + {b}")
                 pargs = argparse.Namespace(**vars(args))
                 pargs.smiles1, pargs.smiles2, pargs.dir = a, b, None
+                if args.focus:
+                    pargs.focus = make_tier([a, b], depth, steps, goal, targets)
                 pair_dir = os.path.join(directory, slug(key))
                 n_before = len(reasonable_steps(db, args.max_ea))
                 try:
@@ -816,6 +951,99 @@ def cmd_network(args):
                                        "rate_limiting": rls, "updated": now()},
                                       strict=False),
                             N.overall == overall)
+        print(f"\nlog written to {logfile}")
+
+
+def read_smiles_list(args):
+    """SMILES from the command line and/or --file (one per line, '#' comments,
+    anything after the first whitespace ignored, so 'O=S=O  SO2' works)."""
+    items = list(args.smiles)
+    if args.file:
+        with open(args.file) as fh:
+            for line in fh:
+                line = line.split("#")[0].strip()
+                if line:
+                    items.append(line.split()[0])
+    out, seen = [], set()
+    for smi in items:
+        canon(smi, strict=True)  # fail early on a typo
+        sk = skeleton(smi)
+        if sk in seen:
+            print(f"note: {smi} is the same molecule as one already listed; skipped")
+            continue
+        seen.add(sk)
+        out.append(smi)
+    return out
+
+
+def cmd_batch(args):
+    db = TinyDB(args.db)
+    species = read_smiles_list(args)
+    if len(species) < (1 if args.self_pairs else 2):
+        sys.exit("error: give at least two SMILES (or one with self pairs)")
+    combos = (itertools.combinations_with_replacement(species, 2) if args.self_pairs
+              else itertools.combinations(species, 2))
+    pairs = sorted(combos, key=lambda ab: ab[0] == ab[1])  # A+B first, then A+A
+    directory = args.dir or "."
+    os.makedirs(directory, exist_ok=True)
+    logfile = os.path.join(directory, "batch.log")
+    console = sys.stdout
+    results, runs = [], 0
+
+    with run_log(logfile):
+        banner(f"ARCS-Kinetics batch: {len(species)} species, {len(pairs)} pair(s)")
+        print(f"  started   : {now()}")
+        print(f"  directory : {os.path.abspath(directory)}")
+        print(f"  database  : {os.path.abspath(args.db)}")
+        print(f"  species   : {', '.join(species)}")
+        status = run_status(db)
+        todo = []
+        for a, b in pairs:
+            key2, st = status.get(pair_skeleton([a, b]), (None, None))
+            if st == "complete" and not args.force:
+                results.append((a, b, "in database", get_entry(db, key2)))
+            elif st and st.startswith("failed") and not (args.retry_failed or args.force):
+                results.append((a, b, "failed before", get_entry(db, key2)))
+            else:
+                todo.append((a, b))
+        print(f"  to run    : {len(todo)} pair(s); "
+              f"{len(pairs) - len(todo)} already in the database")
+        if args.max_runs is not None and len(todo) > args.max_runs:
+            print(f"  --max-runs: only the first {args.max_runs} will be run")
+
+        for i, (a, b) in enumerate(todo):
+            if args.max_runs is not None and runs >= args.max_runs:
+                results.append((a, b, "not run (--max-runs)", None))
+                continue
+            key = reaction_key(a, b)
+            pair_dir = os.path.join(directory, slug(key))
+            section(f"pair {i + 1}/{len(todo)}: {a} + {b}")
+            pargs = argparse.Namespace(**vars(args))
+            pargs.smiles1, pargs.smiles2, pargs.dir = a, b, None
+            runs += 1
+            try:
+                with contextlib.redirect_stdout(console):  # details -> pair log
+                    run_pair(pargs, db, key, pair_dir, suggest=False)
+                entry = get_entry(db, key)
+                results.append((a, b, "run", entry))
+                log(f"done -> {pair_dir}/arcskin.log")
+                print_best(entry.get("best_pathways") or [])
+            except Exception as e:
+                results.append((a, b, "FAILED", get_entry(db, key)))
+                log(f"FAILED: {e}  (see {pair_dir}/arcskin.log)")
+
+        banner("summary")
+        print(f"  finished  : {now()}  ({runs} pair(s) run)")
+        rows = []
+        for a, b, what, entry in results:
+            best = (entry or {}).get("best_pathways") or []
+            if not best:
+                rows.append((f"{a} + {b}", what, "-", "-", "-"))
+            for j, bp in enumerate(best):
+                rows.append((f"{a} + {b}" if j == 0 else "", what if j == 0 else "",
+                             " + ".join(bp["products"]), fnum(bp["Ea"]),
+                             bp.get("kind") or ""))
+        table(rows, ["pair", "status", "best products", "Ea/eV", "kind"])
         print(f"\nlog written to {logfile}")
 
 
@@ -902,6 +1130,9 @@ def main(argv=None):
                    help="deepest generation to run (default 4); generation 1 = "
                    "pairs of the starting flask, 2 = pairs possible after one "
                    "step, ...")
+    w.add_argument("--no-focus", dest="focus", action="store_false",
+                   help="NEB every candidate pathway of each pair, instead of "
+                   "the ones that complete the reaction first")
     w.add_argument("--best", action="store_true",
                    help="don't stop at the first mechanism found: run pairs "
                    "until --max-runs / none left, then report the one with the "
@@ -910,6 +1141,23 @@ def main(argv=None):
                    help="also rerun pairs whose earlier run failed")
     run_options(w)
     w.set_defaults(func=cmd_network)
+
+    bt = sub.add_parser("batch", help="run every pair from a list of SMILES "
+                        "(A+B for all A, B, plus A+A)")
+    bt.add_argument("smiles", nargs="*", help="SMILES to combine")
+    bt.add_argument("--file", "-f", help="text file with one SMILES per line")
+    bt.add_argument("--no-self", dest="self_pairs", action="store_false",
+                    help="skip A + A pairs")
+    bt.add_argument("--dir", help="where pair directories and batch.log go "
+                    "(default: current directory)")
+    bt.add_argument("--max-runs", type=int, default=None,
+                    help="stop after this many new pair runs")
+    bt.add_argument("--retry-failed", action="store_true",
+                    help="rerun pairs whose earlier run failed")
+    bt.add_argument("--force", action="store_true",
+                    help="rerun pairs even if already in the database")
+    run_options(bt)
+    bt.set_defaults(func=cmd_batch)
 
     l = sub.add_parser("list", help="list reactions in the database")
     l.set_defaults(func=cmd_list)
