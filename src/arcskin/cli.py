@@ -53,6 +53,7 @@ from tinydb import Query, TinyDB
 from arcskin.spin import DEFAULT_MODEL
 
 RDLogger.DisableLog("rdApp.warning")
+RDLogger.DisableLog("rdApp.error")  # hypervalent spellings (O=N=O) are handled; no noise
 
 
 def loose_mol(smi):
@@ -1538,74 +1539,159 @@ def read_smiles_list(args):
     return out
 
 
+def batch_products(entries, known, max_ea=None, stable_only=False):
+    """New species from a generation's pair results: products of each pair's
+    best (sane) NEB pathways that aren't already in `known` (skeletons),
+    spelt the most closed-shell way seen. Returns ({skeleton: SMILES}, rows)
+    where rows = (product, from pair, Ea) for the log."""
+    spellings, origin = {}, {}
+    for entry in entries:
+        for bp in (entry or {}).get("best_pathways") or []:
+            if not bp.get("sane"):
+                continue
+            try:
+                ea = float(bp["Ea"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if max_ea is not None and ea > max_ea:
+                continue
+            for x in bp.get("products") or []:
+                sk = skeleton(x)
+                if sk in known or (stable_only and not is_stable(x)):
+                    continue
+                spellings.setdefault(sk, set()).add(x)
+                if sk not in origin or ea < origin[sk][1]:
+                    origin[sk] = (" + ".join(entry.get("smiles") or []), ea)
+    new = {sk: min(v, key=lambda x: (spelling_score(x), x))
+           for sk, v in spellings.items()}
+    rows = [(new[sk], origin[sk][0], fnum(origin[sk][1])) for sk in sorted(new, key=new.get)]
+    return new, rows
+
+
 def cmd_batch(args):
     db = TinyDB(args.db)
     species = read_smiles_list(args)
     if len(species) < (1 if args.self_pairs else 2):
         sys.exit("error: give at least two SMILES (or one with self pairs)")
-    combos = (itertools.combinations_with_replacement(species, 2) if args.self_pairs
-              else itertools.combinations(species, 2))
-    pairs = sorted(combos, key=lambda ab: ab[0] == ab[1])  # A+B first, then A+A
     directory = args.dir or "."
     os.makedirs(directory, exist_ok=True)
     logfile = os.path.join(directory, "batch.log")
     console = sys.stdout
     results, runs = [], 0
+    known = {skeleton(x): x for x in species}  # every species so far
+    new = dict(known)                          # this generation's new species
+    stop_reason = None
 
     with run_log(logfile):
-        banner(f"ARCS-Kinetics batch: {len(species)} species, {len(pairs)} pair(s)")
+        banner(f"ARCS-Kinetics batch: {len(species)} species"
+               + (f", up to {args.generations} generation(s)" if args.generations > 1
+                  else ""))
         print(f"  started   : {now()}")
         print(f"  directory : {os.path.abspath(directory)}")
         print(f"  database  : {os.path.abspath(args.db)}")
         print(f"  species   : {', '.join(species)}")
-        status = run_status(db, args.model)
-        todo = []
-        for a, b in pairs:
-            key2, st = status.get(pair_skeleton([a, b]), (None, None))
-            if st == "complete" and not args.force:
-                results.append((a, b, "in database", get_entry(db, key2)))
-            elif st and st.startswith("failed") and not (args.retry_failed or args.force):
-                results.append((a, b, "failed before", get_entry(db, key2)))
-            else:
-                todo.append((a, b))
-        print(f"  to run    : {len(todo)} pair(s); "
-              f"{len(pairs) - len(todo)} already in the database")
-        if args.max_runs is not None and len(todo) > args.max_runs:
-            print(f"  --max-runs: only the first {args.max_runs} will be run")
+        if args.generations > 1:
+            print("  new species: products of each pair's best sane pathway"
+                  + (f" with Ea <= {args.product_max_ea} eV" if args.product_max_ea
+                     is not None else "")
+                  + ("; closed-shell neutral only" if args.stable_only else ""))
 
-        for i, (a, b) in enumerate(todo):
-            if args.max_runs is not None and runs >= args.max_runs:
-                results.append((a, b, "not run (--max-runs)", None))
-                continue
-            key = reaction_key(a, b)
-            pair_dir = os.path.join(directory, pair_dirname(key))
-            section(f"pair {i + 1}/{len(todo)}: {a} + {b}")
-            pargs = argparse.Namespace(**vars(args))
-            pargs.smiles1, pargs.smiles2, pargs.dir = a, b, None
-            runs += 1
-            try:
-                with contextlib.redirect_stdout(console):  # details -> pair log
-                    run_pair(pargs, db, key, pair_dir, suggest=False)
+        for gen in range(1, args.generations + 1):
+            # pairs with at least one species new in this generation
+            old = [x for k, x in known.items() if k not in new]
+            fresh = list(new.values())
+            pairs = list(itertools.combinations(fresh, 2))
+            pairs += [(a, b) for a in fresh for b in old]
+            if args.self_pairs:
+                pairs += [(a, a) for a in fresh]
+            pairs.sort(key=lambda ab: ab[0] == ab[1])  # A+B first, then A+A
+            banner(f"generation {gen}: {len(fresh)} new species, {len(pairs)} pair(s)", "-")
+            if gen > 1:
+                print(f"  new species: {', '.join(fresh)}")
+
+            status = run_status(db, args.model)
+            todo, gen_entries = [], []
+            for a, b in pairs:
+                key2, st = status.get(pair_skeleton([a, b]), (None, None))
+                if st == "complete" and not args.force:
+                    entry = get_entry(db, key2)
+                    results.append((gen, a, b, "in database", entry))
+                    gen_entries.append(entry)
+                elif st and st.startswith("failed") and not (args.retry_failed or args.force):
+                    results.append((gen, a, b, "failed before", get_entry(db, key2)))
+                else:
+                    todo.append((a, b))
+            print(f"  to run    : {len(todo)} pair(s); "
+                  f"{len(pairs) - len(todo)} already in the database")
+
+            for i, (a, b) in enumerate(todo):
+                if args.max_runs is not None and runs >= args.max_runs:
+                    results.append((gen, a, b, "not run (--max-runs)", None))
+                    stop_reason = f"reached --max-runs ({args.max_runs})"
+                    continue
+                key = reaction_key(a, b)
+                pair_dir = os.path.join(directory, pair_dirname(key))
+                section(f"gen {gen}, pair {i + 1}/{len(todo)}: {a} + {b}")
+                pargs = argparse.Namespace(**vars(args))
+                pargs.smiles1, pargs.smiles2, pargs.dir = a, b, None
+                runs += 1
+                try:
+                    with contextlib.redirect_stdout(console):  # details -> pair log
+                        run_pair(pargs, db, key, pair_dir, suggest=False)
+                except Exception as e:
+                    results.append((gen, a, b, "FAILED", get_entry(db, key)))
+                    log(f"FAILED: {e}  (see {pair_dir}/arcskin.log)")
+                    continue
                 entry = get_entry(db, key)
-                results.append((a, b, "run", entry))
+                results.append((gen, a, b, "run", entry))
+                gen_entries.append(entry)
                 log(f"done -> {pair_dir}/arcskin.log")
                 print_best(entry.get("best_pathways") or [])
-            except Exception as e:
-                results.append((a, b, "FAILED", get_entry(db, key)))
-                log(f"FAILED: {e}  (see {pair_dir}/arcskin.log)")
+
+            if stop_reason:
+                break
+            if gen == args.generations:
+                if args.generations > 1:
+                    stop_reason = f"reached --generations ({args.generations})"
+                break
+            new, rows = batch_products(gen_entries, known, args.product_max_ea,
+                                       args.stable_only)
+            if not new:
+                stop_reason = f"no new species from generation {gen}"
+                log(stop_reason)
+                break
+            if args.max_species and len(known) + len(new) > args.max_species:
+                keep = sorted(new, key=lambda k: float(
+                    next(r[2] for r in rows if r[0] == new[k])))
+                keep = keep[:max(0, args.max_species - len(known))]
+                if not keep:
+                    stop_reason = f"reached --max-species ({args.max_species})"
+                    log(stop_reason)
+                    break
+                log(f"--max-species ({args.max_species}): keeping the "
+                    f"{len(keep)} new species made with the lowest Ea")
+                new = {k: new[k] for k in keep}
+                rows = [r for r in rows if r[0] in new.values()]
+            section(f"new species from generation {gen}: {len(new)}")
+            table(rows, ["species", "made by", "Ea/eV"])
+            known.update(new)
 
         banner("summary")
         print(f"  finished  : {now()}  ({runs} pair(s) run)")
+        if stop_reason:
+            print(f"  stopped   : {stop_reason}")
+        print(f"  species   : {len(known)} ({', '.join(known.values())})")
         rows = []
-        for a, b, what, entry in results:
+        for gen, a, b, what, entry in results:
             best = (entry or {}).get("best_pathways") or []
             if not best:
-                rows.append((f"{a} + {b}", what, "-", "-", "-"))
+                rows.append((gen, f"{a} + {b}", what, "-", "-", "-"))
             for j, bp in enumerate(best):
-                rows.append((f"{a} + {b}" if j == 0 else "", what if j == 0 else "",
+                rows.append((gen if j == 0 else "", f"{a} + {b}" if j == 0 else "",
+                             what if j == 0 else "",
                              " + ".join(bp["products"]), fnum(bp["Ea"]),
                              bp.get("kind") or ""))
-        table(rows, ["pair", "status", "best products", "Ea/eV", "kind"])
+        table(rows, ["gen", "pair", "status", "best products", "Ea/eV", "kind"])
         print(f"\nlog written to {logfile}")
 
 
@@ -1804,6 +1890,21 @@ def main(argv=None):
                     help="rerun pairs whose earlier run failed")
     bt.add_argument("--force", action="store_true",
                     help="rerun pairs even if already in the database")
+    bt.add_argument("--generations", type=int, default=1,
+                    help="keep going: after each generation, the products of its "
+                    "pairs' best sane pathways become new species, and the next "
+                    "generation runs every pair involving a new species. Stops "
+                    "after this many generations or when no new species appear "
+                    "(default 1 = just the given list)")
+    bt.add_argument("--product-max-ea", type=float, default=None,
+                    help="only products made with Ea <= this (eV) become new "
+                    "species (default: any sane pathway)")
+    bt.add_argument("--stable-only", action="store_true",
+                    help="only closed-shell, neutral products become new species "
+                    "(no radicals)")
+    bt.add_argument("--max-species", type=int, default=None,
+                    help="cap on the total number of species; extra new ones are "
+                    "dropped, highest Ea first")
     run_options(bt)
     bt.set_defaults(func=cmd_batch)
 
