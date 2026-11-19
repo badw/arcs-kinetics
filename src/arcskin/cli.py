@@ -419,14 +419,6 @@ def skeleton(smi):
     return Chem.MolToSmiles(mol)
 
 
-def match_targets(targets, made):
-    """{target: species in `made` with the same connectivity (or None)}."""
-    by_skel = {}
-    for sp in made:
-        by_skel.setdefault(skeleton(sp), sp)
-    return {t: (t if t in made else by_skel.get(skeleton(t))) for t in targets}
-
-
 def reasonable_steps(db, max_ea):
     """Every sane NEB pathway in the database with Ea <= max_ea."""
     steps = []
@@ -448,110 +440,107 @@ def reasonable_steps(db, max_ea):
     return sorted(steps, key=lambda st: st["Ea"])
 
 
-def reach(start, steps):
-    """Species reachable from `start` through `steps`.
-    Returns {species: producing step or None}, {species: generation}."""
-    made = {s: None for s in start}
-    gen = {s: 0 for s in start}
-    changed = True
-    while changed:
-        changed = False
-        for st in steps:  # lowest Ea first, so it wins when several steps make X
-            if all(r in made for r in st["reactants"]):
-                g = 1 + max(gen[r] for r in st["reactants"])
-                for p in st["products"]:
-                    if p not in made:
-                        made[p], gen[p], changed = st, g, True
-    return made, gen
+# A "flask" is a multiset of molecules ({skeleton: count}), starting from the
+# overall reactants. A step can only fire if its reactants are all in the flask,
+# and it consumes them, so e.g. after 2 NO -> N2O2 in 2 NO + O2 there is no NO
+# left for NO + N2O2.
+def _fkey(c):
+    return tuple(sorted((k, v) for k, v in c.items() if v > 0))
 
 
-def net(reactants, products, k=1):
-    """Net stoichiometry {skeleton: coeff} (products +, reactants -)."""
-    c = Counter()
-    for x in products:
-        c[skeleton(x)] += k
-    for x in reactants:
-        c[skeleton(x)] -= k
-    return {sp: v for sp, v in c.items() if v}
-
-
-def balance(reactants, products, steps, max_mult=4):
-    """Find whole-number multiples of `steps` that add up exactly to the overall
-    reaction (k x overall, k >= 1), so every intermediate cancels.
-
-    Minimises the rate-limiting (largest) barrier first, then the number of step
-    uses. Returns (k, [(multiplier, step), ...] in a runnable order) or None."""
-    import numpy as np
-    from scipy.optimize import Bounds, LinearConstraint, milp
-
-    target = net(reactants, products)
-    uniq = {}  # one copy of each distinct, atom-balanced, non-trivial step
+def flask_steps(steps, name):
+    """(reactant Counter, product Counter, step) per distinct, atom-balanced,
+    non-trivial step (lowest Ea kept). Fills `name` {skeleton: SMILES}."""
+    best = {}
     for st in steps:
-        v = net(st["reactants"], st["products"])
-        if not v or atom_counts(st["reactants"]) != atom_counts(st["products"]):
+        r = Counter(skeleton(x) for x in st["reactants"])
+        p = Counter(skeleton(x) for x in st["products"])
+        if r == p or atom_counts(st["reactants"]) != atom_counts(st["products"]):
             continue
-        sig = tuple(sorted(v.items()))
-        if sig not in uniq or st["Ea"] < uniq[sig][0]["Ea"]:
-            uniq[sig] = (st, v)
-    if not uniq:
-        return None
-    cand = sorted(uniq.values(), key=lambda sv: sv[0]["Ea"])
-    species = sorted(set(target) | {sp for _, v in cand for sp in v})
-
-    for cut in sorted({st["Ea"] for st, _ in cand}):  # minimax barrier
-        use = [(st, v) for st, v in cand if st["Ea"] <= cut]
-        n = len(use)
-        A = np.array([[v.get(sp, 0) for _, v in use] + [-target.get(sp, 0)]
-                      for sp in species], float)
-        res = milp(c=np.r_[np.ones(n), 0.0],
-                   constraints=LinearConstraint(A, 0, 0),
-                   integrality=np.ones(n + 1),
-                   bounds=Bounds(np.r_[np.zeros(n), 1], np.r_[np.full(n, max_mult), max_mult]))
-        if res.success:
-            x = np.rint(res.x).astype(int)
-            chosen = [(int(m), st) for m, (st, _) in zip(x[:n], use) if m > 0]
-            return int(x[n]), order_steps(chosen, reactants, int(x[n]))
-    return None
+        for x in st["reactants"] + st["products"]:
+            name.setdefault(skeleton(x), x)
+        k = (_fkey(r), _fkey(p))
+        if k not in best or st["Ea"] < best[k][2]["Ea"]:
+            best[k] = (r, p, st)
+    return list(best.values())
 
 
-def order_steps(chosen, reactants, k):
-    """Order (mult, step) so each step's reactants exist when it runs."""
-    have = Counter()
-    for x in reactants:
-        have[skeleton(x)] += k
-    todo, out = [[m, st] for m, st in chosen], []
-    while todo:
-        for item in todo:
-            need = Counter(skeleton(x) for x in item[1]["reactants"])
-            if all(have[sp] >= c for sp, c in need.items()):
-                have.subtract(need)
-                have.update(skeleton(x) for x in item[1]["products"])
-                item[0] -= 1
-                if not out or out[-1][1] is not item[1]:
-                    out.append([0, item[1]])
-                out[-1][0] += 1
-                if item[0] == 0:
-                    todo.remove(item)
-                break
-        else:  # needs a species made later (cycle/catalyst): append the rest
-            out += todo
-            break
-    return [(m, st) for m, st in out]
+def explore(start, steps, max_states=20000):
+    """Every flask state reachable from `start`, each with its cheapest route.
+
+    Cost of a route = (largest Ea along it, number of steps), so the first
+    route to any state is the one with the lowest rate-limiting barrier.
+    Returns ({state: (cost, parent state, step)}, truncated)."""
+    import heapq
+
+    s0 = _fkey(start)
+    best = {s0: ((0.0, 0), None, None)}
+    heap, done, truncated = [(0.0, 0, s0)], set(), False
+    while heap:
+        ea, n, sk = heapq.heappop(heap)
+        if sk in done:
+            continue
+        done.add(sk)
+        flask = Counter(dict(sk))
+        for r, p, st in steps:
+            if any(flask[x] < v for x, v in r.items()):
+                continue
+            nk = _fkey(flask - r + p)
+            cost = (max(ea, st["Ea"]), n + 1)
+            if nk not in best or cost < best[nk][0]:
+                if nk not in best and len(best) >= max_states:
+                    truncated = True
+                    continue
+                best[nk] = (cost, sk, st)
+                heapq.heappush(heap, (*cost, nk))
+    return best, truncated
 
 
-def candidate_pairs(db, pool, gen, tried, retry_failed=False):
-    """Untried A + B pairs (A may equal B) from `pool`, earliest generation first."""
+def route_to(states, sk):
+    """Steps leading to state `sk`, first step first."""
+    out = []
+    while states[sk][1] is not None:
+        _, sk, st = states[sk]
+        out.append(st)
+    return out[::-1]
+
+
+def flask_pairs(states, goal=None):
+    """{(a, b): (cost, state)} for every pair that can meet in some reachable
+    flask (a == b needs two of them), with the cheapest such state. Flasks that
+    already hold `goal` are skipped (nothing left to make)."""
+    pairs = {}
+    for sk, (cost, _, _) in states.items():
+        flask = dict(sk)
+        if goal and all(flask.get(k, 0) >= v for k, v in goal.items()):
+            continue
+        for a, b in itertools.combinations_with_replacement(sorted(flask), 2):
+            if a == b and flask[a] < 2:
+                continue
+            if (a, b) not in pairs or cost < pairs[(a, b)][0]:
+                pairs[(a, b)] = (cost, sk)
+    return pairs
+
+
+def candidate_pairs(db, pairs, name, tried, retry_failed=False):
+    """Untried pairs from flask_pairs, cheapest flask first, A+B before A+A."""
     status = {e["key"]: e.get("status", "") for e in db.all()}
     out = []
-    for a, b in itertools.combinations_with_replacement(sorted(pool), 2):
-        key = reaction_key(a, b)
+    for (a, b), (cost, sk) in pairs.items():
+        sa, sb = name[a], name[b]
+        key = reaction_key(sa, sb)
         st = status.get(key)
         if key in tried or st == "complete" or st == "running":
             continue
         if st and st.startswith("failed") and not retry_failed:
             continue
-        out.append(((max(gen[a], gen[b]), gen[a] + gen[b], a == b, key), a, b, key))
-    return [(a, b, key) for _, a, b, key in sorted(out)]
+        out.append(((cost[1], cost[0], a == b, key), sa, sb, key, sk))
+    return [(sa, sb, key, sk) for _, sa, sb, key, sk in sorted(out)]
+
+
+def fmt_flask(sk, name):
+    return " + ".join(f"{v} {name.get(k, k)}" if v > 1 else name.get(k, k)
+                      for k, v in sk) or "(empty)"
 
 
 def print_mechanism(steps):
@@ -572,12 +561,22 @@ def cmd_network(args):
     console = sys.stdout
     networks, N = db.table("networks"), Query()
 
+    name = {}  # skeleton -> SMILES shown/run (user's spelling wins)
+    for x in reactants + products:
+        name.setdefault(skeleton(x), x)
+    start = Counter({k: v * args.scale for k, v in
+                     Counter(skeleton(x) for x in reactants).items()})
+    goal = Counter({k: v * args.scale for k, v in
+                    Counter(skeleton(x) for x in products).items()})
+
     with run_log(logfile):
         banner(f"ARCS-Kinetics network search: {overall}")
         print(f"  started   : {now()}")
         print(f"  directory : {os.path.abspath(directory)}")
         print(f"  database  : {os.path.abspath(args.db)}")
         print(f"  targets   : {', '.join(targets)}")
+        print(f"  flask     : {fmt_flask(_fkey(start), name)}"
+              + (f"  (overall x {args.scale})" if args.scale > 1 else ""))
         print(f"  criteria  : sane NEB pathway with Ea <= {args.max_ea} eV; "
               f"at most {args.max_runs} new pair run(s)")
         ra, pa = atom_counts(reactants), atom_counts(products)
@@ -587,32 +586,32 @@ def cmd_network(args):
         if not targets:
             sys.exit("error: nothing to make (all products are also reactants)")
 
-        runs, tried, mech = 0, set(), None
+        runs, tried, route = 0, set(), None
         while True:
-            steps = reasonable_steps(db, args.max_ea)
-            made, gen = reach(set(reactants), steps)
-            found = match_targets(targets, made)
-            have = [t for t in targets if found[t]]
-            log(f"{len(steps)} reasonable step(s) in database; "
-                f"{len(made)} species reachable; targets reached: "
+            steps = flask_steps(reasonable_steps(db, args.max_ea), name)
+            states, truncated = explore(start, steps, args.max_states)
+            if truncated:
+                log(f"WARNING: stopped exploring at --max-states ({args.max_states})")
+            done = [sk for sk in states
+                    if all(dict(sk).get(k, 0) >= v for k, v in goal.items())]
+            reached = {k for sk in states for k, _ in sk}
+            have = [t for t in targets if skeleton(t) in reached]
+            log(f"{len(steps)} usable step(s); {len(states)} flask state(s), "
+                f"{len(reached)} species reachable; targets reached: "
                 f"{len(have)}/{len(targets)}")
-            if len(have) == len(targets):
-                usable = [st for st in steps
-                          if all(r in made for r in st["reactants"])]
-                mech = balance(reactants, products, usable, args.max_mult)
-                if mech:
-                    rl = max(st["Ea"] for _, st in mech[1])
-                    for t in targets:
-                        if found[t] != t:
-                            log(f"target {t} matched as {found[t]} (same connectivity)")
-                    if not args.best:
-                        break
-                    log(f"balanced mechanism found (rate-limiting Ea = {rl:.3f} eV); "
-                        f"--best: continuing to look for a lower one")
-                else:
-                    log("targets reachable, but no combination of steps balances "
-                        "the overall reaction yet; continuing")
-            cands = candidate_pairs(db, made, gen, tried, args.retry_failed)
+            if done:
+                sk = min(done, key=lambda s: states[s][0])
+                route = (sk, route_to(states, sk))
+                rl = states[sk][0][0]
+                if not args.best:
+                    break
+                log(f"mechanism found (rate-limiting Ea = {rl:.3f} eV); "
+                    f"--best: continuing to look for a lower one")
+            elif len(have) == len(targets):
+                log("targets can be made, but not all from the available "
+                    "amounts at once; continuing")
+            cands = candidate_pairs(db, flask_pairs(states, goal), name, tried,
+                                    args.retry_failed)
             if not cands:
                 log("no untried pairs left")
                 break
@@ -620,11 +619,12 @@ def cmd_network(args):
                 log(f"reached --max-runs ({args.max_runs}); "
                     f"{len(cands)} pair(s) still untried")
                 break
-            a, b, key = cands[0]
+            a, b, key, sk = cands[0]
             runs += 1
             tried.add(key)
             section(f"run {runs}/{args.max_runs}: {a} + {b}  "
-                    f"(generation {max(gen[a], gen[b])}, {len(cands) - 1} more queued)")
+                    f"({len(cands) - 1} more queued)")
+            log(f"possible once the flask holds: {fmt_flask(sk, name)}")
             pargs = argparse.Namespace(**vars(args))
             pargs.smiles1, pargs.smiles2, pargs.dir = a, b, None
             pair_dir = os.path.join(directory, slug(key))
@@ -638,44 +638,49 @@ def cmd_network(args):
             entry = get_entry(db, key)
             log(f"done -> {pair_dir}/arcskin.log")
             print_best(entry.get("best_pathways") or [])
-            new = len(reasonable_steps(db, args.max_ea)) - n_before
-            log(f"{new} new reasonable step(s)")
+            new = len(flask_steps(reasonable_steps(db, args.max_ea), {})) - n_before
+            log(f"{new} new usable step(s)")
 
         banner("result")
         print(f"  finished  : {now()}  ({runs} new pair run(s))")
-        if mech is None:
-            missing = [t for t in targets if not found[t]]
+        if route is None:
+            missing = [t for t in targets if skeleton(t) not in reached]
             if missing:
                 print(f"  NO mechanism found. Unreached target(s): {', '.join(missing)}")
             else:
-                print("  NO mechanism found. All targets are reachable, but no "
-                      "combination of steps balances the overall reaction")
-            print(f"  reachable species: {', '.join(sorted(made))}")
-            print("  try raising --max-ea / --max-runs, or --retry-failed")
+                print("  NO mechanism found. Every target can be made, but not all "
+                      "of them from the available amounts")
+            print(f"  reachable species: {', '.join(sorted(name.get(k, k) for k in reached))}")
+            print("  try raising --max-ea / --max-runs / --scale, or --retry-failed")
             networks.upsert(jsanitize({"overall": overall, "status": "not found",
-                                       "reachable": sorted(made), "updated": now()}),
+                                       "reachable": sorted(name.get(k, k) for k in reached),
+                                       "updated": now()}),
                             N.overall == overall)
         else:
-            k, steps_used = mech
-            rls = max((st for _, st in steps_used), key=lambda st: st["Ea"])
+            sk, seq = route
+            grouped = []  # collapse repeated consecutive steps
+            for st in seq:
+                if grouped and grouped[-1][1] is st:
+                    grouped[-1][0] += 1
+                else:
+                    grouped.append([1, st])
+            rls = max(seq, key=lambda st: st["Ea"])
             section("mechanism")
-            print_mechanism(steps_used)
-            total, name = Counter(), {}
-            for m, st in steps_used:
-                for x in st["reactants"] + st["products"]:
-                    name.setdefault(skeleton(x), x)
-                for sp, v in net(st["reactants"], st["products"], m).items():
-                    total[name[sp]] += v
-            lhs = [f"{-v} {sp}" for sp, v in sorted(total.items()) if v < 0]
-            rhs = [f"{v} {sp}" for sp, v in sorted(total.items()) if v > 0]
-            print(f"\n  net                : {' + '.join(lhs)} -> {' + '.join(rhs)}"
-                  + (f"   (= {k} x overall)" if k > 1 else "   (= overall)"))
-            print(f"  rate-limiting step : {fmt_rxn(rls['reactants'], rls['products'])}"
+            print_mechanism(grouped)
+            flask = start
+            print("\n  flask:")
+            print(f"    start     : {fmt_flask(_fkey(flask), name)}")
+            for i, (m, st) in enumerate(grouped):
+                for _ in range(m):
+                    flask = (flask - Counter(skeleton(x) for x in st["reactants"])
+                             + Counter(skeleton(x) for x in st["products"]))
+                print(f"    after {i + 1:<3d} : {fmt_flask(_fkey(flask), name)}")
+            print(f"\n  rate-limiting step : {fmt_rxn(rls['reactants'], rls['products'])}"
                   f"  (Ea = {rls['Ea']:.3f} eV)")
             networks.upsert(jsanitize({"overall": overall, "status": "found",
-                                       "multiple": k,
+                                       "scale": args.scale,
                                        "mechanism": [dict(st, times=m)
-                                                     for m, st in steps_used],
+                                                     for m, st in grouped],
                                        "rate_limiting": rls, "updated": now()},
                                       strict=False),
                             N.overall == overall)
@@ -756,11 +761,13 @@ def main(argv=None):
                    help="largest barrier (eV) a step may have (default 1.0)")
     w.add_argument("--max-runs", type=int, default=20,
                    help="maximum number of new pair runs (default 20)")
-    w.add_argument("--max-mult", type=int, default=4,
-                   help="most times one step may be used in the balanced "
-                   "mechanism (default 4)")
+    w.add_argument("--scale", type=int, default=1,
+                   help="amount of material: N x the overall reactants "
+                   "(default 1, i.e. exactly what the equation says)")
+    w.add_argument("--max-states", type=int, default=20000,
+                   help="cap on flask states explored (default 20000)")
     w.add_argument("--best", action="store_true",
-                   help="don't stop at the first balanced mechanism: run pairs "
+                   help="don't stop at the first mechanism found: run pairs "
                    "until --max-runs / none left, then report the one with the "
                    "lowest rate-limiting barrier")
     w.add_argument("--retry-failed", action="store_true",
