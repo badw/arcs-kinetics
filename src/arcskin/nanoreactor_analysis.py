@@ -23,8 +23,10 @@ import multiprocess as mp
 import warp as wp
 
 wp.config.log_level = wp.LOG_WARNING  # no 'Warp initialized' banner (per process)
-from aimnet.calculators import AIMNet2ASE
+from aimnet.calculators import AIMNet2ASE  # noqa: F401
 import warnings
+
+from arcskin.spin import DEFAULT_MODEL, get_calculator, ground_mult, set_state
 
 
 from rdkit import Chem, DataStructs
@@ -36,18 +38,14 @@ rdBase.DisableLog("rdApp.warning")
 _calc = None
 
 
-def _get_calc():
+def _get_calc(model=None):
+    """Per-process calculator (worker processes build their own)."""
     global _calc
     if _calc is None:
-        import warp as wp
-
-        wp.config.log_level = wp.LOG_WARNING
         import torch
 
         torch.set_num_threads(1)
-        from aimnet.calculators import AIMNet2ASE
-
-        _calc = AIMNet2ASE("aimnet2")
+        _calc = get_calculator(model or DEFAULT_MODEL)
     return _calc
 
 
@@ -99,8 +97,15 @@ def compare_molecules(
 
 class AnalyseNanoReactor:
     def __init__(
-        self, reactants: tuple[str, str] = None, skip_step: int = 5, calculator=None
+        self,
+        reactants: tuple[str, str] = None,
+        skip_step: int = 5,
+        calculator=None,
+        model: str = None,
     ):
+        """model: AIMNet2 model used when no calculator is given
+        (default arcskin.spin.DEFAULT_MODEL, i.e. aimnet2nse)."""
+        self.model = model or DEFAULT_MODEL
         warnings.simplefilter("ignore")
         self.trajectory = defaultdict(dict)
         self.unique_structures = defaultdict(lambda: defaultdict(list))
@@ -108,8 +113,8 @@ class AnalyseNanoReactor:
         wp.config.log_level = wp.LOG_WARNING
         mp.set_start_method("spawn", force=True)
         if not calculator:
-            print("calculating with default calculator: aimnet")
-            self.calculator = AIMNet2ASE("aimnet2")
+            print(f"calculating with default calculator: {self.model}")
+            self.calculator = get_calculator(self.model)
         elif calculator == "tblite":
             print("calculating with TBLite")
             self.calculator = calculator
@@ -158,7 +163,11 @@ class AnalyseNanoReactor:
                 Atoms.fromdict(at) for at in data[seed][:: self.skip_step]
             ]
 
-    def relax_atoms(self, atoms: Atoms, fmax=0.05, steps=500, calculator=None):
+    def relax_atoms(
+        self, atoms: Atoms, fmax=0.05, steps=500, calculator=None, charge=None, mult=None
+    ):
+        """Relax in place. For AIMNet2 the charge/multiplicity are taken from the
+        arguments, else atoms.info, else neutral and the lowest spin."""
         if calculator == "tblite":
             # use TBLIte xtb
             mult = 2 if sum(atoms.numbers) % 2 else 1
@@ -166,6 +175,11 @@ class AnalyseNanoReactor:
                 method="GFN2-xTB", multiplicity=mult, max_iterations=1000, verbosity=0
             )
         else:
+            if charge is None:
+                charge = atoms.info.get("charge", 0)
+            if mult is None:
+                mult = atoms.info.get("mult")
+            set_state(atoms, charge, mult)
             atoms.calc = calculator
         BFGS(atoms, logfile=None).run(fmax=fmax, steps=steps)
         return atoms
@@ -270,7 +284,7 @@ class AnalyseNanoReactor:
         fmax=0.05,
         relax_frame=True,
     ):
-        calc = _get_calc()
+        calc = _get_calc(getattr(self, "model", None))
         if relax_frame:
             self.relax_atoms(frame, fmax=0.1, calculator=calc)
         atoms_list = self.seperate_atoms(frame)
@@ -392,6 +406,27 @@ class AnalyseNanoReactor:
         else:
             return None
 
+    def species_energy(self, smi, fmax=0.05):
+        """Relaxed energy of one isolated species in its ground spin state
+        (cached per SMILES)."""
+        cache = self.__dict__.setdefault("_energy_cache", {})
+        if smi not in cache:
+            from arcskin.make_neb_endpoints import embed
+
+            try:  # embed() also handles single atoms; UFF fallback
+                atoms, _ = embed(smi)
+                charge = atoms.info.get("charge", 0)
+            except Exception as e:
+                print(f"could not embed {smi}: {e}; energy set to nan")
+                cache[smi] = np.nan
+                return cache[smi]
+            calc = self.calculator
+            mult = None if calc == "tblite" else ground_mult(atoms, calc, charge)
+            atoms = self.relax_atoms(atoms, fmax=fmax, calculator=calc,
+                                     charge=charge, mult=mult)
+            cache[smi] = atoms.get_potential_energy()
+        return cache[smi]
+
     def relax_all_paths(self, possible_paths, fmax=0.05):
         for k, v in possible_paths.items():
             reactants = v["reactants"]
@@ -399,20 +434,12 @@ class AnalyseNanoReactor:
             possible_paths[k]["reactants_energies"] = []
             possible_paths[k]["products_energies"] = []
             for r in reactants:
-                r_atoms = smiles_to_atoms(r)[0]
-                r_relaxed = self.relax_atoms(
-                    r_atoms, fmax=fmax, calculator=self.calculator
-                )
                 possible_paths[k]["reactants_energies"].append(
-                    r_relaxed.get_potential_energy()
+                    self.species_energy(r, fmax)
                 )
             for p in products:
-                p_atoms = smiles_to_atoms(p)[0]
-                p_relaxed = self.relax_atoms(
-                    p_atoms, fmax=fmax, calculator=self.calculator
-                )
                 possible_paths[k]["products_energies"].append(
-                    p_relaxed.get_potential_energy()
+                    self.species_energy(p, fmax)
                 )
             possible_paths[k]["diff"] = np.sum(
                 possible_paths[k]["products_energies"]

@@ -2,7 +2,7 @@
 import warp as wp
 
 wp.config.log_level = wp.LOG_WARNING  # no 'Warp initialized' banner
-from aimnet.calculators import AIMNet2ASE
+from aimnet.calculators import AIMNet2ASE  # noqa: F401  (kept for callers)
 from ase.build import minimize_rotation_and_translation
 from ase.mep import NEB
 import warnings
@@ -13,6 +13,9 @@ from ase.utils import forcecurve
 import tqdm
 
 from arcskin.check_endpoints import expected_bonds, geometry_bonds
+from arcskin.make_neb_endpoints import _kabsch
+from arcskin.spin import (DEFAULT_MODEL, fragment_mults, fragments,
+                          get_calculator, set_state, system_mult)
 
 MIN_PATH = 0.5  # Å; shorter bands mean the endpoints are (nearly) the same structure
 
@@ -22,6 +25,29 @@ def relax(atoms, calc, fmax=0.05, steps=200, logfile=None):
     atoms.calc = calc
     BFGS(atoms, logfile=logfile).run(fmax=fmax, steps=steps)
     return atoms
+
+
+def relax_fragments(atoms, frags, mults, calc, fmax=0.05, steps=200):
+    """Relax each molecule on its own (in its own spin state) and put it back
+    where it was (Kabsch), so molecules placed next to each other can't bond
+    during the relaxation. A single fragment is just relaxed."""
+    if len(frags) <= 1:
+        return relax(atoms, calc, fmax, steps)
+    for idx, m in zip(frags, mults):
+        sub = atoms[idx]
+        set_state(sub, 0, m)
+        relax(sub, calc, fmax, steps)
+        atoms.positions[idx] = _kabsch(sub.positions, atoms.positions[idx])[0]
+    return atoms
+
+
+def endpoint_fragments(reac, reactant_smiles):
+    """Molecules of each endpoint from the intended bonding (None if unknown)."""
+    try:
+        exp_r, exp_p = expected_bonds(reactant_smiles, reac)
+    except Exception:
+        return None, None
+    return fragments(len(reac), exp_r), fragments(len(reac), exp_p)
 
 
 def run_neb(
@@ -135,6 +161,8 @@ def determine_best(results):
             "kind": results[i]["kind"],
             "reason": results[i]["reason"],
             "path_length": results[i]["path_length"],
+            "mult": results[i].get("mult"),
+            "spin_allowed": results[i].get("spin_allowed", True),
         }
     ranking = pd.DataFrame(new_results).T.sort_values(by=["Ea", "dE"], ascending=True)
     return ranking
@@ -149,17 +177,47 @@ def run_all(
     steps=500,
     trajectory=None,
     logfile=None,
+    model=None,
+    separate_products=True,
 ):
+    """NEB every pathway in endpoints_dict.
+
+    model: AIMNet2 model when no calculator is given (default aimnet2nse).
+    Spin: each molecule gets its ground multiplicity; the NEB runs at the lowest
+    total spin both sides can reach (e.g. N2O2 + O2(triplet) -> 2 NO2 is a
+    triplet NEB). separate_products: relax the product molecules one at a time,
+    so products placed side by side can't bond to each other."""
     if not calculator:
-        print("running with aimnet")
-        calc = AIMNet2ASE("aimnet2")
+        model = model or DEFAULT_MODEL
+        print(f"running with {model}")
+        calc = get_calculator(model)
     else:
         calc = calculator
     results = {}
 
     for k, v in tqdm.tqdm(endpoints_dict.items()):
-        reactants = relax(v["reactants"], calc)
-        products = relax(v["products"], calc)
+        reactants, products = v["reactants"], v["products"]
+        charge = int(reactants.info.get("charge", 0))
+        fr_r, fr_p = endpoint_fragments(reactants, v["overall"]["reactants"])
+        if fr_r is None:
+            fr_r = fr_p = [list(range(len(reactants)))]
+        if charge == 0:
+            m_r = fragment_mults(reactants, fr_r, calc)
+            m_p = fragment_mults(products, fr_p, calc)
+            mult, spin_ok = system_mult(m_r, m_p)
+        else:  # charged: no per-fragment charges known, use lowest spin
+            m_r = m_p = None
+            mult, spin_ok = None, True
+        set_state(reactants, charge, mult)
+        set_state(products, charge, mult)
+        mult = reactants.info["mult"]
+
+        reactants = relax(reactants, calc)
+        if separate_products and m_p is not None:
+            products = relax_fragments(products, fr_p, m_p, calc)
+            set_state(products, charge, mult)  # back to the system's state
+        else:
+            products = relax(products, calc)
         images, E, Ea, dE = run_neb(
             reactants,
             products,
@@ -176,6 +234,10 @@ def run_all(
         sane, kind, reason = diagnose(
             reactants, products, v["overall"]["reactants"], path_length
         )
+        if not spin_ok:
+            reason = (reason + "; " if reason else "") + (
+                f"spin-forbidden: reactant spins {m_r} can't couple to the "
+                f"same total as product spins {m_p} (run at mult {mult})")
         if kind == "barrierless" and "diff" in v["overall"]:
             # both NEB endpoints are the product, so the band's dE is 0 by
             # construction; use the isolated-species reaction energy instead
@@ -193,6 +255,8 @@ def run_all(
             "kind": kind,
             "reason": reason,
             "path_length": path_length,
+            "mult": mult,
+            "spin_allowed": spin_ok,
         }
 
     results = determine_best(results)

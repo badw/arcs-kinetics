@@ -15,8 +15,8 @@ Every reactant and discovered product is also recorded in a `compounds` table.
     arcskin network "2 [N]=O + O=O -> 2 [O][N]=O"
     arcskin batch "O=S=O" "[O]N=O" "[N]=O" "O=O" "O"
 
-Each A + B pair runs in its own SMILES1_SMILES2/ directory with a log in
-SMILES1_SMILES2/arcskin.log, whether started by `run` or `network`. `network`
+Each A + B pair runs in its own SMILES1-SMILES2/ directory with a log in
+SMILES1-SMILES2/arcskin.log, whether started by `run` or `network`. `network`
 appends its own summary to network.log; pairs already in the database are reused.
 """
 
@@ -35,6 +35,8 @@ from monty.json import jsanitize
 from rdkit import Chem, RDLogger
 from rdkit.Chem import Descriptors
 from tinydb import Query, TinyDB
+
+from arcskin.spin import DEFAULT_MODEL
 
 RDLogger.DisableLog("rdApp.warning")
 
@@ -214,14 +216,15 @@ def neb_pathways(args, db, key, paths):
         log("no endpoints could be built; skipping NEB")
         return []
     log(f"running NEB on {len(endpoints)} pathway(s)")
-    ranking = run_all(endpoints, n_images=args.n_images, climb=True, fmax=args.fmax)
+    ranking = run_all(endpoints, n_images=args.n_images, climb=True, fmax=args.fmax,
+                      model=args.model, separate_products=args.separate_products)
     ranking = ranking.reset_index(names="pathway")
     new = ranking.to_dict("records")
     table([(r["pathway"], fmt_rxn(r["reactants"], r["products"]),
-            fnum(r["Ea"]), fnum(r["dE"]), bool(r["sane"]),
+            fnum(r["Ea"]), fnum(r["dE"]), r.get("mult"), bool(r["sane"]),
             r.get("kind"), r.get("reason") or "")
            for _, r in ranking.sort_values("Ea").iterrows()],
-          ["#", "pathway", "Ea/eV", "dE/eV", "sane", "kind", "note"])
+          ["#", "pathway", "Ea/eV", "dE/eV", "mult", "sane", "kind", "note"])
 
     done = {str(r["pathway"]) for r in new}
     old = [r for r in (get_entry(db, key) or {}).get("neb") or []
@@ -275,7 +278,7 @@ def run_pipeline(args, db, key, directory, suggest=True):
            if k not in ("smiles1", "smiles2", "db")], ["parameter", "value"])
 
     save(db, key, smiles=smiles, directory=directory, status="running",
-         settings=settings, log=os.path.join(directory, "arcskin.log"))
+         settings=settings, model=args.model, log=os.path.join(directory, "arcskin.log"))
     add_compounds(db, key, smiles, "reactant")
 
     # 1. nanoreactor
@@ -296,7 +299,8 @@ def run_pipeline(args, db, key, directory, suggest=True):
 
     # 2. analysis
     section("[2/4] nanoreactor analysis")
-    anr = AnalyseNanoReactor(skip_step=args.skip_step, reactants=smiles)
+    anr = AnalyseNanoReactor(skip_step=args.skip_step, reactants=smiles,
+                             model=args.model)
     anr.read_trajectory(xnr.trajectory_locations, format="xyz")
     anr.analyse_trajectories(n_cpus=args.n_cpus)
     possible_paths = anr.get_possible_paths_dict()
@@ -424,8 +428,12 @@ def cmd_run(args):
     db = TinyDB(args.db)
     key = reaction_key(args.smiles1, args.smiles2)
     entry = get_entry(db, key)
+    if entry and entry_model(entry) != args.model:
+        print(f"note: {key} was computed with {entry_model(entry)}; "
+              f"rerunning with {args.model}")
+        entry = None
     if not entry:  # same molecules, different SMILES spelling?
-        key2, st = run_status(db).get(pair_skeleton([args.smiles1, args.smiles2]),
+        key2, st = run_status(db, args.model).get(pair_skeleton([args.smiles1, args.smiles2]),
                                       (None, None))
         if key2 and st == "complete":
             entry = get_entry(db, key2)
@@ -434,7 +442,13 @@ def cmd_run(args):
         print_best(entry.get("best_pathways", []))
         sys.exit(f"error: {entry['key']} has already been run (in {args.db}); "
                  f"use --force to rerun")
-    run_pair(args, db, key, args.dir or slug(key))
+    run_pair(args, db, key, args.dir or pair_dirname(key))
+
+
+def pair_dirname(key):
+    """Directory for a pair: each SMILES made filesystem-safe, joined by '-'
+    (e.g. O=O.[N]=O -> O_O-N_O)."""
+    return "-".join(slug(x) or "X" for x in key.split("."))
 
 
 def slug(text):
@@ -511,7 +525,7 @@ def skeleton(smi):
     return Chem.MolToSmiles(mol)
 
 
-def all_steps(db, max_ea, keep="best", ea_tol=0.1):
+def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None):
     """Every NEB pathway in the database, each with `problem` set to why it
     can't be used ('' if it can).
 
@@ -523,6 +537,7 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1):
     for e in db.all():
         if e.get("status") != "complete":
             continue
+        other = model and entry_model(e) != model
         for r in e.get("neb") or []:
             st = {"source": e["key"], "pathway": r.get("pathway"),
                   "reactants": list(r.get("reactants") or []),
@@ -533,7 +548,9 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1):
                 st["Ea"] = float(r["Ea"])
             except (TypeError, ValueError, KeyError):
                 st["problem"] = "no Ea"
-            if not st["problem"] and not r.get("sane"):
+            if other:
+                st["problem"] = f"computed with {entry_model(e)}, not {model}"
+            elif not st["problem"] and not r.get("sane"):
                 st["problem"] = f"not sane ({r.get('kind') or 'old check'})"
             elif not st["problem"] and st["Ea"] > max_ea:
                 st["problem"] = f"Ea > {max_ea}"
@@ -564,16 +581,17 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1):
     return sorted(steps, key=lambda st: (st["Ea"] is None, st["Ea"] or 0))
 
 
-def reasonable_steps(db, max_ea, keep="best", ea_tol=0.1):
+def reasonable_steps(db, max_ea, keep="best", ea_tol=0.1, model=None):
     """The NEB pathways a network search may use (see all_steps)."""
-    return [st for st in all_steps(db, max_ea, keep, ea_tol) if not st["problem"]]
+    return [st for st in all_steps(db, max_ea, keep, ea_tol, model)
+            if not st["problem"]]
 
 
-def print_step_report(db, max_ea, states, name, keep="best", ea_tol=0.1):
+def print_step_report(db, max_ea, states, name, keep="best", ea_tol=0.1, model=None):
     """Why each step in the database was or wasn't usable."""
     reached = {k for sk in states for k, _ in sk}
     rows = []
-    for st in all_steps(db, max_ea, keep, ea_tol):
+    for st in all_steps(db, max_ea, keep, ea_tol, model):
         why = st["problem"]
         if not why:
             need = Counter(skeleton(x) for x in st["reactants"])
@@ -600,19 +618,38 @@ def _fkey(c):
 
 def flask_steps(steps, name):
     """(reactant Counter, product Counter, step) per distinct, non-trivial step
-    (lowest Ea kept). Fills `name` {skeleton: SMILES}."""
-    best = {}
+    (lowest Ea kept). Fills `name` {skeleton: SMILES} for species not already
+    named, using the most closed-shell spelling seen (see spelling_score)."""
+    best, spellings = {}, {}
     for st in steps:
         r = Counter(skeleton(x) for x in st["reactants"])
         p = Counter(skeleton(x) for x in st["products"])
         if r == p:
             continue
         for x in st["reactants"] + st["products"]:
-            name.setdefault(skeleton(x), x)
+            spellings.setdefault(skeleton(x), set()).add(x)
         k = (_fkey(r), _fkey(p))
         if k not in best or st["Ea"] < best[k][2]["Ea"]:
             best[k] = (r, p, st)
+    for k, options in spellings.items():
+        if k not in name:
+            name[k] = min(options, key=lambda x: (spelling_score(x), x))
     return list(best.values())
+
+
+def spelling_score(smi):
+    """Lower = better SMILES to start a nanoreactor run from: valid for RDKit,
+    then fewest radical electrons, then fewest formal charges. OpenBabel often
+    writes e.g. H2SO4 as the 'diradical' [O]S(O)(O)[O]; O=S(=O)(O)O wins."""
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        mol, bad = loose_mol(smi), 1
+    else:
+        bad = 0
+    if mol is None:
+        return (2, 0, 0)
+    return (bad, sum(a.GetNumRadicalElectrons() for a in mol.GetAtoms()),
+            sum(abs(a.GetFormalCharge()) for a in mol.GetAtoms()))
 
 
 def explore(start, steps, max_states=20000):
@@ -693,14 +730,24 @@ def flask_pairs(states, depth, goal=None):
     return {k: (g, sk) for k, (g, _, sk) in pairs.items()}
 
 
+def entry_model(e):
+    """Model an entry was computed with (entries from before models were
+    recorded used aimnet2)."""
+    return e.get("model") or (e.get("settings") or {}).get("model") or "aimnet2"
+
+
 def pair_skeleton(smiles):
     return tuple(sorted(skeleton(x) for x in smiles))
 
 
-def run_status(db):
-    """{skeleton pair: (key, status)}: one entry per pair, however it was spelt."""
+def run_status(db, model=None):
+    """{skeleton pair: (key, status)}: one entry per pair, however it was spelt.
+    With `model`, entries computed with another model are ignored (they count
+    as not run)."""
     out = {}
     for e in db.all():
+        if model and entry_model(e) != model:
+            continue
         smiles = e.get("smiles") or e["key"].split(".")
         sk = pair_skeleton(smiles)
         st = e.get("status", "")
@@ -709,11 +756,11 @@ def run_status(db):
     return out
 
 
-def candidate_pairs(db, pairs, name, tried, retry_failed=False):
+def candidate_pairs(db, pairs, name, tried, retry_failed=False, model=None):
     """Untried pairs as (generation, smiles1, smiles2, key, state), lowest
     generation first, A+B before A+A. A pair counts as run whatever SMILES it
     was run with (O=N=O + X is the same pair as O=[N+][O-] + X)."""
-    status = run_status(db)
+    status = run_status(db, model)
     out = []
     for (a, b), (gen, sk) in pairs.items():
         sa, sb = name[a], name[b]
@@ -761,13 +808,15 @@ def make_tier(pair, depth, steps, goal, targets, max_states=2000):
     return tier
 
 
-def deferred_candidates(db, pairs):
+def deferred_candidates(db, pairs, model=None):
     """[(generation, key, [ids])] for entries with deferred pathways whose pair
     can meet in a reachable flask, lowest generation first."""
     out = []
     for e in db.all():
         ids = e.get("deferred") or []
         if not ids or e.get("status") != "complete":
+            continue
+        if model and entry_model(e) != model:
             continue
         a, b = sorted(skeleton(x) for x in (e.get("smiles") or e["key"].split(".")))
         if (a, b) in pairs:
@@ -797,6 +846,7 @@ def cmd_network(args):
     logfile = os.path.join(directory, "network.log")
     console = sys.stdout
     networks, N = db.table("networks"), Query()
+    use_model = None if args.any_model else args.model
 
     # skeleton -> SMILES used to run/show a species: your reactants as written,
     # otherwise the nanoreactor's own spelling (so the analysis recognises it),
@@ -818,6 +868,8 @@ def cmd_network(args):
         print(f"  targets   : {', '.join(targets)}")
         print(f"  flask     : {fmt_flask(_fkey(start), name)}"
               + (f"  (overall x {args.scale})" if args.scale > 1 else ""))
+        print(f"  model     : {args.model}"
+              + ("  (also using results from other models)" if args.any_model else ""))
         print(f"  criteria  : sane NEB pathway with Ea <= {args.max_ea} eV; "
               f"steps kept per pair run: {args.steps}"
               + (f" (within {args.ea_tol} eV)" if args.steps == "tol" else "") + "; "
@@ -832,7 +884,7 @@ def cmd_network(args):
         runs, tried, route, said = 0, set(), None, set()
         while True:
             name = dict(base_name)
-            steps = flask_steps(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol), name)
+            steps = flask_steps(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model), name)
             for x in products:
                 name.setdefault(skeleton(x), x)
             states, truncated = explore(start, steps, args.max_states)
@@ -862,10 +914,11 @@ def cmd_network(args):
                 log("targets can be made, but not all from the available "
                     "amounts at once; continuing")
             fp = flask_pairs(states, depth, goal)
-            cands = candidate_pairs(db, fp, name, tried, args.retry_failed)
+            cands = candidate_pairs(db, fp, name, tried, args.retry_failed,
+                                    None if args.any_model else args.model)
             gen = cands[0][0] if cands else None
             if not cands or gen > args.max_generations:
-                defer = [d for d in deferred_candidates(db, fp)
+                defer = [d for d in deferred_candidates(db, fp, use_model)
                          if d[0] <= args.max_generations]
                 if defer and runs < args.max_runs:
                     g, key, ids = defer[0]
@@ -874,7 +927,7 @@ def cmd_network(args):
                     runs += 1
                     section(f"deferred pathways, run {runs}/{args.max_runs}: "
                             f"{a} + {b} ({len(ids)} pathway(s))")
-                    pair_dir = entry.get("directory") or os.path.join(directory, slug(key))
+                    pair_dir = entry.get("directory") or os.path.join(directory, pair_dirname(key))
                     paths = {i: entry["pathways"][str(i)] for i in ids
                              if str(i) in (entry.get("pathways") or {})}
                     pargs = argparse.Namespace(**vars(args))
@@ -917,8 +970,8 @@ def cmd_network(args):
                 pargs.smiles1, pargs.smiles2, pargs.dir = a, b, None
                 if args.focus:
                     pargs.focus = make_tier([a, b], depth, steps, goal, targets)
-                pair_dir = os.path.join(directory, slug(key))
-                n_before = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol))
+                pair_dir = os.path.join(directory, pair_dirname(key))
+                n_before = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model))
                 try:
                     with contextlib.redirect_stdout(console):  # details -> pair log
                         run_pair(pargs, db, key, pair_dir, suggest=False)
@@ -928,7 +981,7 @@ def cmd_network(args):
                 entry = get_entry(db, key)
                 log(f"done -> {pair_dir}/arcskin.log")
                 print_best(entry.get("best_pathways") or [])
-                new = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol)) - n_before
+                new = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model)) - n_before
                 log(f"{new} new usable step(s)")
             if stop:
                 break
@@ -945,7 +998,8 @@ def cmd_network(args):
             print(f"  reachable species: {', '.join(sorted(name.get(k, k) for k in reached))}")
             print("  try raising --max-ea / --max-runs / --scale, or --retry-failed")
             section("steps in the database")
-            print_step_report(db, args.max_ea, states, name, args.steps, args.ea_tol)
+            print_step_report(db, args.max_ea, states, name, args.steps, args.ea_tol,
+                              use_model)
             networks.upsert(jsanitize({"overall": overall, "status": "not found",
                                        "reachable": sorted(name.get(k, k) for k in reached),
                                        "updated": now()}),
@@ -1023,7 +1077,7 @@ def cmd_batch(args):
         print(f"  directory : {os.path.abspath(directory)}")
         print(f"  database  : {os.path.abspath(args.db)}")
         print(f"  species   : {', '.join(species)}")
-        status = run_status(db)
+        status = run_status(db, args.model)
         todo = []
         for a, b in pairs:
             key2, st = status.get(pair_skeleton([a, b]), (None, None))
@@ -1043,7 +1097,7 @@ def cmd_batch(args):
                 results.append((a, b, "not run (--max-runs)", None))
                 continue
             key = reaction_key(a, b)
-            pair_dir = os.path.join(directory, slug(key))
+            pair_dir = os.path.join(directory, pair_dirname(key))
             section(f"pair {i + 1}/{len(todo)}: {a} + {b}")
             pargs = argparse.Namespace(**vars(args))
             pargs.smiles1, pargs.smiles2, pargs.dir = a, b, None
@@ -1127,6 +1181,15 @@ def main(argv=None):
         r.add_argument("--n-cpus", type=int, default=4)
         r.add_argument("--n-images", type=int, default=16)
         r.add_argument("--fmax", type=float, default=0.05)
+        r.add_argument("--model", default=DEFAULT_MODEL,
+                       help=f"AIMNet2 model (default {DEFAULT_MODEL}; aimnet2 is "
+                       "closed-shell and overbinds radicals). Results from other "
+                       "models are not reused")
+        r.add_argument("--no-separate-products", dest="separate_products",
+                       action="store_false",
+                       help="relax the NEB product endpoint as one complex instead "
+                       "of one molecule at a time (products may then bond to each "
+                       "other)")
         r.add_argument("--ea-tol", type=float, default=0.1,
                        help="also suggest pathways with Ea within this of the best (eV)")
 
@@ -1142,7 +1205,7 @@ def main(argv=None):
                        "is connected by reasonable steps")
     w.add_argument("reaction", help="SMILES reaction, e.g. "
                    "\"2 [N]=O + O=O -> 2 [O][N]=O\"")
-    w.add_argument("--dir", help="where the SMILES1_SMILES2/ pair directories and "
+    w.add_argument("--dir", help="where the SMILES1-SMILES2/ pair directories and "
                    "network.log go (default: current directory)")
     w.add_argument("--max-ea", type=float, default=1.0,
                    help="largest barrier (eV) a step may have (default 1.0)")
@@ -1162,6 +1225,8 @@ def main(argv=None):
                    "may use: best = only the lowest-Ea one (default), tol = also "
                    "those within --ea-tol of it, all = every sane one with "
                    "Ea <= --max-ea")
+    w.add_argument("--any-model", action="store_true",
+                   help="also use results computed with other models")
     w.add_argument("--no-focus", dest="focus", action="store_false",
                    help="NEB every candidate pathway of each pair, instead of "
                    "the ones that complete the reaction first")
