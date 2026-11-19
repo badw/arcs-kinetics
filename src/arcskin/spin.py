@@ -21,6 +21,7 @@ from collections import Counter
 
 import networkx as nx
 import numpy as np
+from ase.calculators.calculator import Calculator, all_changes
 from ase.data import covalent_radii
 from ase.optimize import BFGS
 
@@ -147,3 +148,45 @@ def fragment_mults(atoms, frags, calc):
     if len(frags) == 1:
         return [ground_mult(atoms, calc, charge)]
     return [ground_mult(atoms[idx], calc, 0) for idx in frags]
+
+
+def envelope_mults(reac_mults, prod_mults, n=2):
+    """The lowest `n` total multiplicities either side can couple to. E.g.
+    singlet N2O5 -> NO2 + NO3 (doublets): [1, 3], so the band can go from the
+    closed-shell singlet to the radical pair, which only the triplet describes
+    at this level."""
+    return sorted(couple(reac_mults) | couple(prod_mults))[:n]
+
+
+class SpinEnvelope(Calculator):
+    """ASE calculator giving, at each geometry, the lowest-energy of several
+    spin states (energy and forces of that state; `mult` says which).
+
+    AIMNet2-NSE's low-spin state is closed-shell, so it can't describe a bond
+    breaking into two radicals: for N2O5 -> NO2 + NO3 its singlet climbs to
+    ~4.9 eV as the fragments separate, while the triplet levels off at ~1.4 eV
+    (isolated fragments: 1.2 eV). The open-shell singlet the real system
+    follows is close to min(singlet, triplet), so NEB on this envelope gives a
+    sensible bond-fission / radical-recombination profile. Costs one
+    evaluation per state."""
+
+    implemented_properties = ["energy", "free_energy", "forces"]
+
+    def __init__(self, base, mults):
+        super().__init__()
+        self.base, self.mults, self.mult = base, list(mults), None
+
+    def calculate(self, atoms=None, properties=("energy",),
+                  system_changes=all_changes):
+        super().calculate(atoms, properties, system_changes)
+        charge = int(self.atoms.info.get("charge", 0))
+        best = None
+        for m in self.mults:
+            a = self.atoms.copy()
+            set_state(a, charge, m)
+            a.calc = self.base
+            e = float(a.get_potential_energy())
+            if best is None or e < best[0]:
+                best = (e, a.get_forces().copy(), m)
+        e, f, self.mult = best
+        self.results = {"energy": e, "free_energy": e, "forces": f}

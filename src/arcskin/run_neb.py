@@ -14,8 +14,9 @@ import tqdm
 
 from arcskin.check_endpoints import expected_bonds, geometry_bonds
 from arcskin.make_neb_endpoints import _kabsch
-from arcskin.spin import (DEFAULT_MODEL, fragment_mults, fragments,
-                          get_calculator, set_state, system_mult)
+from arcskin.spin import (DEFAULT_MODEL, SpinEnvelope, envelope_mults,
+                          fragment_mults, fragments, get_calculator, is_nse,
+                          set_state, system_mult)
 
 MIN_PATH = 0.5  # Å; shorter bands mean the endpoints are (nearly) the same structure
 
@@ -163,6 +164,8 @@ def determine_best(results):
             "path_length": results[i]["path_length"],
             "mult": results[i].get("mult"),
             "spin_allowed": results[i].get("spin_allowed", True),
+            "spin_envelope": results[i].get("spin_envelope"),
+            "image_mults": results[i].get("image_mults"),
         }
     ranking = pd.DataFrame(new_results).T.sort_values(by=["Ea", "dE"], ascending=True)
     return ranking
@@ -179,6 +182,7 @@ def run_all(
     logfile=None,
     model=None,
     separate_products=True,
+    spin_envelope=True,
 ):
     """NEB every pathway in endpoints_dict.
 
@@ -186,7 +190,11 @@ def run_all(
     Spin: each molecule gets its ground multiplicity; the NEB runs at the lowest
     total spin both sides can reach (e.g. N2O2 + O2(triplet) -> 2 NO2 is a
     triplet NEB). separate_products: relax the product molecules one at a time,
-    so products placed side by side can't bond to each other."""
+    so products placed side by side can't bond to each other.
+    spin_envelope: when the two lowest total spins both sides can reach differ
+    (radicals involved), run the band on the lower of the two at each image
+    (see spin.SpinEnvelope); otherwise a bond breaking into two radicals is
+    forced onto the closed-shell singlet and its energy is far too high."""
     if not calculator:
         model = model or DEFAULT_MODEL
         print(f"running with {model}")
@@ -218,10 +226,17 @@ def run_all(
             set_state(products, charge, mult)  # back to the system's state
         else:
             products = relax(products, calc)
+        band_calc, env = calc, None
+        if spin_envelope and m_r is not None and is_nse(calc):
+            env = envelope_mults(m_r, m_p)
+            if len(env) > 1:
+                band_calc = SpinEnvelope(calc, env)
+            else:
+                env = None
         images, E, Ea, dE = run_neb(
             reactants,
             products,
-            calc,
+            band_calc,
             n_images=n_images,
             fmax=fmax,
             climb=climb,
@@ -234,6 +249,12 @@ def run_all(
         sane, kind, reason = diagnose(
             reactants, products, v["overall"]["reactants"], path_length
         )
+        image_mults = None
+        if env:
+            image_mults = []
+            for im in images:  # which state each image ended up on
+                band_calc.get_potential_energy(im)
+                image_mults.append(band_calc.mult)
         if not spin_ok:
             reason = (reason + "; " if reason else "") + (
                 f"spin-forbidden: reactant spins {m_r} can't couple to the "
@@ -257,6 +278,8 @@ def run_all(
             "path_length": path_length,
             "mult": mult,
             "spin_allowed": spin_ok,
+            "spin_envelope": env,
+            "image_mults": image_mults,
         }
 
     results = determine_best(results)

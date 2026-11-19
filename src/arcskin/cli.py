@@ -14,10 +14,14 @@ Every reactant and discovered product is also recorded in a `compounds` table.
     arcskin suggest -n 10
     arcskin network "2 [N]=O + O=O -> 2 [O][N]=O"
     arcskin batch "O=S=O" "[O]N=O" "[N]=O" "O=O" "O"
+    arcskin decompose "O=N(=O)ON(=O)=O"
 
 Each A + B pair runs in its own SMILES1-SMILES2/ directory with a log in
 SMILES1-SMILES2/arcskin.log, whether started by `run` or `network`. `network`
-appends its own summary to network.log; pairs already in the database are reused.
+writes its summary to network_<reaction>.log (e.g. network_2N_O+O_O_to_2O_N_O.log),
+so several reactions can share a directory; pairs already in the database are
+reused. Single-NEB steps go in proposed/<reaction>.log (A + B -> missing
+products) and decomposed/<species>.log (X -> A + B).
 """
 
 import argparse
@@ -233,7 +237,8 @@ def neb_records(args, paths):
         return []
     log(f"running NEB on {len(endpoints)} pathway(s)")
     ranking = run_all(endpoints, n_images=args.n_images, climb=True, fmax=args.fmax,
-                      model=args.model, separate_products=args.separate_products)
+                      model=args.model, separate_products=args.separate_products,
+                      spin_envelope=getattr(args, "spin_envelope", True))
     ranking = ranking.reset_index(names="pathway")
     new = ranking.to_dict("records")
     table([(r["pathway"], fmt_rxn(r["reactants"], r["products"]),
@@ -568,7 +573,8 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None):
       "tol"  - the lowest-Ea one plus any within ea_tol eV of it
       "all"  - every sane pathway with Ea <= max_ea"""
     steps = []
-    proposals = [{"key": f"proposed:{d['key']}", "status": "complete",
+    proposals = [{"key": f"{d.get('origin', 'proposed')}:{d['key']}",
+                  "status": "complete",
                   "model": d.get("model"), "neb": [d["neb"]] if d.get("neb") else []}
                  for d in db.table("proposals").all()]
     for e in db.all() + proposals:
@@ -893,6 +899,101 @@ def proposals(db, depth, goal, name, model):
     return out
 
 
+def _fragment_smiles(frag):
+    """SMILES of a fragment cut out of a molecule. A charged fragment (from a
+    zwitterionic spelling like O=[N+][O-]) is rewritten neutral, with radicals
+    on atoms short of their usual valence."""
+    frag = Chem.RWMol(frag)
+    if sum(a.GetFormalCharge() for a in frag.GetAtoms()) != 0:
+        pt = Chem.GetPeriodicTable()
+        for a in frag.GetAtoms():
+            a.SetFormalCharge(0)
+            order = sum(b.GetBondTypeAsDouble() for b in a.GetBonds())
+            val = pt.GetDefaultValence(a.GetAtomicNum())
+            a.SetNumRadicalElectrons(max(0, int(val - order - a.GetTotalNumHs())))
+    frag.UpdatePropertyCache(strict=False)
+    raw = Chem.MolToSmiles(frag, allHsExplicit=True)  # every atom bracketed
+    nice = canon(raw)
+    try:
+        return nice if atom_counts([nice]) == atom_counts([raw]) else raw
+    except ValueError:
+        return raw
+
+
+def fragmentations(smi):
+    """Every way to split `smi` into two pieces by breaking one bond between
+    heavy atoms (not in a ring), as [[frag1, frag2], ...], one per distinct pair
+    of fragments. E.g. O2N-O-NO2 -> [NO2 + NO3], [O2N-O-NO + O]."""
+    mol = loose_mol(smi)
+    if mol is None:
+        return []
+    mol = Chem.RWMol(mol)
+    for a in mol.GetAtoms():  # pin H counts so nothing is added on re-reading
+        a.SetNumExplicitHs(a.GetTotalNumHs())
+        a.SetNoImplicit(True)
+    out, seen = [], set()
+    for b in mol.GetBonds():
+        i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
+        if b.IsInRing() or 1 in (mol.GetAtomWithIdx(i).GetAtomicNum(),
+                                 mol.GetAtomWithIdx(j).GetAtomicNum()):
+            continue
+        rw = Chem.RWMol(mol)
+        n = int(round(b.GetBondTypeAsDouble()))
+        rw.RemoveBond(i, j)
+        for k in (i, j):  # each end keeps the electrons of the broken bond
+            at = rw.GetAtomWithIdx(k)
+            at.SetNumRadicalElectrons(at.GetNumRadicalElectrons() + n)
+        rw.UpdatePropertyCache(strict=False)
+        frags = Chem.GetMolFrags(rw, asMols=True, sanitizeFrags=False)
+        if len(frags) != 2:
+            continue
+        prods = sorted(_fragment_smiles(f) for f in frags)
+        k = tuple(sorted(skeleton(p) for p in prods))
+        if k in seen:
+            continue
+        seen.add(k)
+        try:
+            if atom_counts([smi]) != atom_counts(prods):
+                continue
+        except ValueError:
+            continue
+        out.append(prods)
+    return out
+
+
+def decompositions(db, states, start, goal, name, model, steps, which="intermediates"):
+    """Unimolecular steps X -> A + B to try: every one-bond split of each
+    species X that a network search can make (see fragmentations), skipping
+    ones already in the database. Catches decompositions such as
+    N2O5 -> NO2 + NO3 that a bimolecular nanoreactor run never tests.
+
+    which: "intermediates" - species reached that are neither starting
+             materials nor overall products (default)
+           "all" - every species in a reachable flask
+    Species only formed as weak complexes are skipped (their falling apart is
+    already the reverse of the pre-equilibrium). Fragments that are known
+    species get their usual spelling. Returns [(X, [A, B], sig)]."""
+    done = {(d["sig"], d.get("model")) for d in db.table("proposals").all()}
+    weak = {k for r, p, st in steps if st["kind"] == "weak complex" for k in p}
+    made = {k for r, p, st in steps if st["kind"] != "weak complex" for k in p}
+    species = {k for sk in states for k, _ in sk}
+    if which != "all":
+        species = {k for k in species if k not in start and k not in goal}
+    out = []
+    for k in sorted(species, key=lambda k: name.get(k, k)):
+        if k in weak and k not in made:
+            continue
+        x = name.get(k, k)
+        if loose_mol(x) is None or loose_mol(x).GetNumAtoms() < 2:
+            continue
+        for prods in fragmentations(x):
+            prods = sorted(name.get(skeleton(p), p) for p in prods)
+            sig = proposal_sig([x], prods)
+            if (sig, model) not in done:
+                out.append((x, prods, sig))
+    return out
+
+
 def reaction_slug(reactants, products):
     """Filename-safe name for an overall reaction, e.g.
     2 [N]=O + O=O -> 2 O=[N+][O-]  ->  2N_O+O_O_to_2O_N_O"""
@@ -902,8 +1003,11 @@ def reaction_slug(reactants, products):
     return f"{side(reactants)}_to_{side(products)}"
 
 
-def run_proposal(args, db, reac, prod, sig, directory, tag="proposed"):
-    """NEB one proposed step and store it in the 'proposals' table."""
+def run_proposal(args, db, reac, prod, sig, directory, tag="proposed",
+                 origin="proposed"):
+    """NEB one proposed step (origin "proposed", log in proposed/<tag>.log) or
+    decomposition (origin "decomposed", log in decomposed/<tag>.log) and store
+    it in the 'proposals' table."""
     from arcskin.nanoreactor_analysis import AnalyseNanoReactor
 
     anr = AnalyseNanoReactor(model=args.model)
@@ -912,19 +1016,72 @@ def run_proposal(args, db, reac, prod, sig, directory, tag="proposed"):
     path["products_energies"] = [anr.species_energy(x) for x in prod]
     path["diff"] = float(np.sum(path["products_energies"])
                          - np.sum(path["reactants_energies"]))
-    pdir = os.path.join(directory, "proposed")
+    path["origin"] = origin
+    pdir = os.path.join(directory, origin)
     os.makedirs(pdir, exist_ok=True)
     rec = None
     with run_log(os.path.join(pdir, f"{tag}.log")):
-        banner(f"proposed step: {fmt_rxn(reac, prod)}")
+        banner(f"{origin} step: {fmt_rxn(reac, prod)}")
         recs = neb_records(args, {0: path})
         rec = jsanitize(recs[0], strict=False) if recs else None
-    key = f"{reaction_key(*reac)}>>{'.'.join(sorted(canon(x) for x in prod))}"
+    key = (f"{'.'.join(sorted(canon(x) for x in reac))}>>"
+           f"{'.'.join(sorted(canon(x) for x in prod))}")
     db.table("proposals").upsert(
         {"sig": sig, "key": key, "model": args.model, "reactants": reac,
-         "products": prod, "neb": rec, "updated": now()},
+         "products": prod, "origin": origin, "neb": rec, "updated": now()},
         (Query().sig == sig) & (Query().model == args.model))
     return rec
+
+
+def run_decomposition(args, db, x, prod, sig, directory, console=None):
+    """NEB X -> A + B (log in decomposed/<X>.log); a failure is recorded so it
+    isn't retried. Returns the NEB record or None."""
+    try:
+        with contextlib.redirect_stdout(console or sys.stdout):
+            return run_proposal(args, db, [x], prod, sig, directory,
+                                slug(x) or "X", origin="decomposed")
+    except Exception as e:
+        log(f"FAILED: {e}")
+        db.table("proposals").upsert(
+            {"sig": sig, "key": sig, "model": args.model, "reactants": [x],
+             "products": prod, "origin": "decomposed", "neb": None,
+             "error": str(e), "updated": now()},
+            (Query().sig == sig) & (Query().model == args.model))
+        return None
+
+
+def cmd_decompose(args):
+    """NEB every one-bond split of each given species."""
+    db = TinyDB(args.db)
+    directory = args.dir or "."
+    os.makedirs(directory, exist_ok=True)
+    done = {(d["sig"], d.get("model")) for d in db.table("proposals").all()}
+    known = {skeleton(c["smiles"]): c["smiles"] for c in db.table("compounds").all()}
+    rows = []
+    for x in args.smiles:
+        x = canon(x, strict=True)
+        splits = fragmentations(x)
+        if not splits:
+            print(f"{x}: no single-bond splits into two pieces")
+        for prod in splits:
+            prod = sorted(known.get(skeleton(p), p) for p in prod)
+            sig = proposal_sig([x], prod)
+            if (sig, args.model) in done and not args.force:
+                old = db.table("proposals").get((Query().sig == sig)
+                                                & (Query().model == args.model))
+                rec = (old or {}).get("neb")
+                note = "already in database"
+            else:
+                print(f"NEB {fmt_rxn([x], prod)}")
+                rec = run_decomposition(args, db, x, prod, sig, directory)
+                note = ""
+            rec = rec or {}
+            rows.append((fmt_rxn([x], prod), fnum(rec.get("Ea")), fnum(rec.get("dE")),
+                         bool(rec.get("sane")), rec.get("kind") or "failed",
+                         note or rec.get("reason") or ""))
+    section("decompositions")
+    table(rows, ["reaction", "Ea/eV", "dE/eV", "sane", "kind", "note"])
+    print(f"\nlogs in {os.path.join(os.path.abspath(directory), 'decomposed')}/")
 
 
 def deferred_candidates(db, pairs, model=None):
@@ -962,7 +1119,8 @@ def cmd_network(args):
     overall = f"{' + '.join(reactants)} -> {' + '.join(products)}"
     directory = args.dir or "."
     os.makedirs(directory, exist_ok=True)
-    logfile = os.path.join(directory, "network.log")
+    logfile = os.path.join(directory,
+                           f"network_{reaction_slug(reactants, products)}.log")
     console = sys.stdout
     networks, N = db.table("networks"), Query()
     use_model = None if args.any_model else args.model
@@ -1059,6 +1217,20 @@ def cmd_network(args):
                                 f"{rec.get('kind')}" + ("" if rec.get("sane")
                                                         else f" ({rec.get('reason')})"))
                     continue  # re-explore with whatever the proposals gave
+            if args.decompose != "none":
+                decs = decompositions(db, states, start, goal, name, args.model,
+                                      steps, args.decompose)
+                if decs:
+                    banner(f"decompositions of reachable species: {len(decs)}", "-")
+                    for x, prod, sig in decs:
+                        log(f"NEB {fmt_rxn([x], prod)}")
+                        rec = run_decomposition(args, db, x, prod, sig, directory,
+                                                console)
+                        if rec:
+                            log(f"  Ea={fnum(rec.get('Ea'))} dE={fnum(rec.get('dE'))} "
+                                f"{rec.get('kind')}" + ("" if rec.get("sane")
+                                                        else f" ({rec.get('reason')})"))
+                    continue  # re-explore with the new unimolecular steps
             fp = flask_pairs(states, depth, goal)
             cands = candidate_pairs(db, fp, name, tried, args.retry_failed,
                                     None if args.any_model else args.model)
@@ -1362,6 +1534,12 @@ def main(argv=None):
                        help="relax the NEB product endpoint as one complex instead "
                        "of one molecule at a time (products may then bond to each "
                        "other)")
+        r.add_argument("--no-spin-envelope", dest="spin_envelope",
+                       action="store_false",
+                       help="run every NEB on one spin state; by default bands "
+                       "involving radicals follow the lower of the two lowest "
+                       "spin states at each image, so bonds can break into "
+                       "radicals (aimnet2nse's singlet is closed-shell)")
         r.add_argument("--ea-tol", type=float, default=0.1,
                        help="also suggest pathways with Ea within this of the best (eV)")
 
@@ -1378,7 +1556,7 @@ def main(argv=None):
     w.add_argument("reaction", help="SMILES reaction, e.g. "
                    "\"2 [N]=O + O=O -> 2 [O][N]=O\"")
     w.add_argument("--dir", help="where the SMILES1-SMILES2/ pair directories and "
-                   "network.log go (default: current directory)")
+                   "network_<reaction>.log go (default: current directory)")
     w.add_argument("--max-ea", type=float, default=1.0,
                    help="largest barrier (eV) a step may have (default 1.0)")
     w.add_argument("--max-runs", type=int, default=20,
@@ -1395,6 +1573,13 @@ def main(argv=None):
     w.add_argument("--no-propose", dest="propose", action="store_false",
                    help="don't NEB steps suggested by the overall equation "
                    "(A + B -> exactly the missing products) before nanoreactor runs")
+    w.add_argument("--decompose", choices=["intermediates", "all", "none"],
+                   default="intermediates",
+                   help="NEB unimolecular decompositions X -> A + B (every "
+                   "one-bond split) of reachable species, e.g. N2O5 -> NO2 + NO3: "
+                   "intermediates = species that are neither starting materials "
+                   "nor overall products (default), all = every reachable "
+                   "species, none = don't")
     w.add_argument("--weak-max", type=float, default=0.15,
                    help="use unbound/weakly bound complexes A + B -> C (NO dimer, "
                    "ONOO, ...) as fast pre-equilibrium steps if C is at most this "
@@ -1434,6 +1619,16 @@ def main(argv=None):
                     help="rerun pairs even if already in the database")
     run_options(bt)
     bt.set_defaults(func=cmd_batch)
+
+    d = sub.add_parser("decompose", help="NEB every one-bond decomposition "
+                       "X -> A + B of the given species")
+    d.add_argument("smiles", nargs="+", help="species to decompose")
+    d.add_argument("--dir", help="where decomposed/<species>.log goes "
+                   "(default: current directory)")
+    d.add_argument("--force", action="store_true",
+                   help="rerun decompositions already in the database")
+    run_options(d)
+    d.set_defaults(func=cmd_decompose)
 
     l = sub.add_parser("list", help="list reactions in the database")
     l.set_defaults(func=cmd_list)
