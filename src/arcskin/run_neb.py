@@ -85,7 +85,10 @@ def run_neb(
         converged = opt.run(fmax=fmax, steps=steps)
     if not converged:
         warnings.warn(f"NEB not converged to fmax={fmax} in {steps} steps")
-    E = np.array([im.get_potential_energy() for im in images])
+    for im in images:  # keep energy/forces with each image (for trajectories.json)
+        im.info["energy"] = float(im.get_potential_energy())
+        im.set_array("forces", np.array(im.get_forces()))
+    E = np.array([im.info["energy"] for im in images])
     E -= E[0]
     return images, E, E.max(), E[-1]
 
@@ -255,6 +258,7 @@ def run_all(
             for im in images:  # which state each image ended up on
                 band_calc.get_potential_energy(im)
                 image_mults.append(band_calc.mult)
+                im.info["band_mult"] = band_calc.mult
         if not spin_ok:
             reason = (reason + "; " if reason else "") + (
                 f"spin-forbidden: reactant spins {m_r} can't couple to the "

@@ -15,6 +15,14 @@ Every reactant and discovered product is also recorded in a `compounds` table.
     arcskin network "2 [N]=O + O=O -> 2 [O][N]=O"
     arcskin batch "O=S=O" "[O]N=O" "[N]=O" "O=O" "O"
     arcskin decompose "O=N(=O)ON(=O)=O"
+    arcskin traj O_O-N_O                 # what's in O_O-N_O/trajectories.json
+    arcskin traj O_O-N_O --neb 0         # -> neb_0.traj for `ase gui`
+
+Each pair directory keeps one trajectories.json with the xtb MD frames and every
+NEB band (images with energies and forces, reaction coordinate, fitted energy
+profile, Ea / Ea_rev / dE); the xtb seed_*/ directories are deleted once the
+frames are saved (--keep-xtb keeps them). See arcskin.trajectories for reading
+it in Python.
 
 Each A + B pair runs in its own SMILES1-SMILES2/ directory with a log in
 SMILES1-SMILES2/arcskin.log, whether started by `run` or `network`. `network`
@@ -209,6 +217,10 @@ def neb_pathways(args, db, key, paths):
     new = neb_records(args, paths)
     if not new:
         return []
+    directory = (get_entry(db, key) or {}).get("directory")
+    if directory and os.path.isdir(directory):
+        save_neb_bands(os.path.join(directory, "trajectories.json"),
+                       {r["pathway"]: r for r in new})
     done = {str(r["pathway"]) for r in new}
     old = [r for r in (get_entry(db, key) or {}).get("neb") or []
            if str(r.get("pathway")) not in done]
@@ -216,6 +228,38 @@ def neb_pathways(args, db, key, paths):
     best = best_pathways(pd.DataFrame(merged), args.ea_tol)
     save(db, key, neb=merged, best_pathways=best)
     return new
+
+
+def save_neb_bands(path, records):
+    """Keep NEB images/energies/reaction coordinate in trajectories.json."""
+    from arcskin.trajectories import save_neb
+
+    try:
+        save_neb(path, records)
+        log(f"NEB band(s) saved to {path}")
+    except Exception as e:  # never lose a run over this
+        log(f"could not save NEB bands to {path}: {e}")
+
+
+def remove_xtb_files(directories, trajectories):
+    """Delete the xtb seed_*/ directories once their frames are safely in
+    trajectories.json."""
+    import shutil
+
+    try:
+        from monty.serialization import loadfn
+
+        saved = loadfn(trajectories)
+    except Exception as e:
+        log(f"keeping xtb files: could not read {trajectories} ({e})")
+        return
+    for d in directories:
+        seed = os.path.basename(os.path.normpath(d))
+        if not seed.startswith("seed_") or not saved.get(seed):
+            log(f"keeping {d}: its frames are not in {trajectories}")
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+    log(f"xtb files removed (MD frames kept in {trajectories})")
 
 
 def neb_records(args, paths):
@@ -322,6 +366,8 @@ def run_pipeline(args, db, key, directory, suggest=True):
          species_counts=dict(anr.unique_smiles_counter),
          species=anr.unique_smiles,
          pathways=possible_paths)
+    if not getattr(args, "keep_xtb", False):
+        remove_xtb_files(xnr.directories, os.path.join(directory, "trajectories.json"))
     counts = dict(anr.unique_smiles_counter)
     log(f"{len(counts)} unique species observed")
     table(sorted(counts.items(), key=lambda kv: -kv[1]), ["species", "count"])
@@ -1076,6 +1122,9 @@ def run_proposal(args, db, reac, prod, sig, directory, tag="proposed",
         banner(f"{origin} step: {fmt_rxn(reac, prod)}")
         recs = neb_records(args, {0: path})
         rec = jsanitize(recs[0], strict=False) if recs else None
+        if recs:
+            save_neb_bands(os.path.join(pdir, "trajectories.json"),
+                           {fmt_rxn(reac, prod): recs[0]})
     key = (f"{'.'.join(sorted(canon(x) for x in reac))}>>"
            f"{'.'.join(sorted(canon(x) for x in prod))}")
     db.table("proposals").upsert(
@@ -1560,6 +1609,49 @@ def cmd_batch(args):
         print(f"\nlog written to {logfile}")
 
 
+def cmd_traj(args):
+    """List what's in a trajectories.json, or write NEB / MD trajectories as
+    ASE files (energies and forces included, so `ase gui neb_0.traj` ->
+    Tools -> NEB shows the energy profile)."""
+    from ase.io import write
+
+    from arcskin.trajectories import load, md_frames, neb_images
+
+    data = load(args.location)
+    seeds = sorted((k for k in data if k.startswith("seed_")),
+                   key=lambda k: int(k.split("_")[1]))
+    neb = data.get("neb") or {}
+    if not args.neb and not args.md:
+        if data.get("combinations"):
+            print(f"pair: {' + '.join(data['combinations'])}")
+        print(f"MD: {', '.join(f'{s} ({len(data[s])} frames)' for s in seeds) or 'none'}")
+        rows = [(k, fmt_rxn(v["reactants"], v["products"]), fnum(v.get("Ea")),
+                 fnum(v.get("Ea_rev")), fnum(v.get("dE")), v.get("kind"),
+                 len(v.get("images") or []))
+                for k, v in sorted(neb.items(), key=lambda kv: str(kv[0]))]
+        if rows:
+            table(rows, ["id", "reaction", "Ea/eV", "Ea_rev/eV", "dE/eV", "kind",
+                         "images"])
+        else:
+            print("NEB: none")
+        return
+    safe = lambda k: slug(str(k)) or "X"  # noqa: E731
+    if args.neb:
+        ids = sorted(neb, key=str) if args.neb == "all" else [args.neb]
+        for k in ids:
+            if args.neb == "all" or not args.output:
+                out = os.path.join(args.output or ".", f"neb_{safe(k)}.traj")
+            else:
+                out = args.output
+            os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+            write(out, neb_images(args.location, k))
+            print(f"NEB {k}: {fmt_rxn(neb[k]['reactants'], neb[k]['products'])} -> {out}")
+    if args.md:
+        out = args.output if args.output and not args.neb else f"{args.md}.traj"
+        write(out, md_frames(args.location, args.md))
+        print(f"MD {args.md} -> {out}")
+
+
 def cmd_list(args):
     for e in TinyDB(args.db).all():
         best = e.get("best_pathways") or []
@@ -1628,6 +1720,9 @@ def main(argv=None):
                        "involving radicals follow the lower of the two lowest "
                        "spin states at each image, so bonds can break into "
                        "radicals (aimnet2nse's singlet is closed-shell)")
+        r.add_argument("--keep-xtb", action="store_true",
+                       help="keep the xtb seed_*/ directories (by default they are "
+                       "deleted once the MD frames are in trajectories.json)")
         r.add_argument("--ea-tol", type=float, default=0.1,
                        help="also suggest pathways with Ea within this of the best (eV)")
 
@@ -1721,6 +1816,17 @@ def main(argv=None):
                    help="rerun decompositions already in the database")
     run_options(d)
     d.set_defaults(func=cmd_decompose)
+
+    t = sub.add_parser("traj", help="list or export the MD / NEB trajectories "
+                       "in a trajectories.json (for ASE)")
+    t.add_argument("location", help="pair directory (or proposed/, decomposed/), "
+                   "or a trajectories.json file")
+    t.add_argument("--neb", metavar="ID", help="NEB pathway to export "
+                   "(id as listed; 'all' = every one)")
+    t.add_argument("--md", metavar="SEED", help="MD seed to export, e.g. seed_0")
+    t.add_argument("-o", "--output", help="output file or, with --neb all, "
+                   "directory (default: neb_<id>.traj / <seed>.traj)")
+    t.set_defaults(func=cmd_traj)
 
     l = sub.add_parser("list", help="list reactions in the database")
     l.set_defaults(func=cmd_list)

@@ -156,11 +156,14 @@ class AnalyseNanoReactor:
             print(f"reactants found = {self.reactants}")
 
     def read_arcskintrajectories(self, data: dict):
-        #  add skip step.
-        del data["combinations"]
-        for i, seed in enumerate(data):
+        """Read the MD frames of a trajectories.json (other keys, such as
+        'combinations' and 'neb', are ignored)."""
+        seeds = sorted((k for k in data if k.startswith("seed_")),
+                       key=lambda k: int(k.split("_")[1]))
+        for i, seed in enumerate(seeds):
             self.trajectory[i] = [
-                Atoms.fromdict(at) for at in data[seed][:: self.skip_step]
+                at if isinstance(at, Atoms) else Atoms.fromdict(at)
+                for at in data[seed][:: self.skip_step]
             ]
 
     def relax_atoms(
