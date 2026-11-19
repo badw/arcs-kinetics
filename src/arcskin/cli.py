@@ -501,6 +501,31 @@ def parse_side(text):
     return out
 
 
+def suggest_balance(reactants, products, max_coef=6):
+    """Smallest whole-number coefficients that balance the species of an
+    unbalanced reaction, as text (e.g. '2 O=[N+][O-] + O -> ...'), or None."""
+    left, right = sorted(set(reactants)), sorted(set(products))
+    species = left + right
+    try:
+        counts = [atom_counts([x]) for x in species]
+    except ValueError:
+        return None
+    elements = sorted({e for c in counts for e in c})
+    for total in range(len(species), max_coef * len(species) + 1):
+        for coefs in itertools.product(range(1, max_coef + 1), repeat=len(species)):
+            if sum(coefs) != total:
+                continue
+            if all(sum(n * c[e] for n, c in zip(coefs[:len(left)], counts))
+                   == sum(n * c[e] for n, c in zip(coefs[len(left):],
+                                                    counts[len(left):]))
+                   for e in elements):
+                side = lambda xs, ns: " + ".join(  # noqa: E731
+                    f"{n} {x}" if n > 1 else x for x, n in zip(xs, ns))
+                return f"{side(left, coefs[:len(left)])} -> " \
+                       f"{side(right, coefs[len(left):])}"
+    return None
+
+
 def parse_reaction(text):
     """Split 'A + B -> C' (also '>>', '=>' or ' = ' with spaces) into two sides."""
     parts = re.split(r"\s*(?:->|>>|=>)\s*|\s+=\s+", text.strip())
@@ -559,7 +584,8 @@ def weak_complex(r, weak_max):
     return diff if np.isfinite(diff) and diff <= weak_max else None
 
 
-def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None):
+def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None,
+              reverse=False):
     """Every NEB pathway in the database, each with `problem` set to why it
     can't be used ('' if it can).
 
@@ -571,7 +597,14 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None):
     keep: which usable pathways of each pair run go into the search
       "best" - only the lowest-Ea one (the dominant channel)
       "tol"  - the lowest-Ea one plus any within ea_tol eV of it
-      "all"  - every sane pathway with Ea <= max_ea"""
+      "all"  - every sane pathway with Ea <= max_ea
+
+    reverse: also add the reverse of every sane pathway (products ->
+      reactants) with Ea_rev = Ea - dE (the band's highest point measured from
+      its product end) and -dE, so a run of the overall *products* (e.g.
+      HONO + HNO3) can supply steps for the forward reaction. Weak complexes
+      get their dissociation (Ea = max(0, -binding energy)). The --steps choice
+      is applied to each direction separately."""
     steps = []
     proposals = [{"key": f"{d.get('origin', 'proposed')}:{d['key']}",
                   "status": "complete",
@@ -598,8 +631,6 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None):
                 st.update(Ea=0.0, dE=bind, kind="weak complex", problem="")
             elif not st["problem"] and not r.get("sane"):
                 st["problem"] = f"not sane ({r.get('kind') or 'old check'})"
-            elif not st["problem"] and st["Ea"] > max_ea:
-                st["problem"] = f"Ea > {max_ea}"
             if not st["problem"]:
                 try:
                     ra, pa = atom_counts(st["reactants"]), atom_counts(st["products"])
@@ -607,13 +638,33 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None):
                         st["problem"] = "atoms don't balance"
                 except ValueError as err:
                     st["problem"] = str(err)
-            steps.append(st)
+            new = [st]
+            if reverse and not st["problem"]:
+                rv = dict(st, reactants=st["products"], products=st["reactants"],
+                          direction="reverse")
+                try:
+                    dE = float(st["dE"])
+                    if bind is not None:
+                        rv.update(Ea=max(0.0, -bind), dE=-bind,
+                                  kind="weak dissociation")
+                    else:
+                        rv.update(Ea=max(0.0, st["Ea"] - dE), dE=-dE,
+                                  kind=f"reverse {st['kind']}".strip())
+                    new.append(rv)
+                except (TypeError, ValueError):
+                    pass
+            for x in new:
+                x.setdefault("direction", "forward")
+                if (not x["problem"] and not x["kind"].startswith("weak")
+                        and x["Ea"] > max_ea):
+                    x["problem"] = f"Ea > {max_ea}"
+                steps.append(x)
     if keep != "all":
         groups = {}
         for st in steps:
-            if not st["problem"] and st["kind"] != "weak complex":
-                groups.setdefault((st["source"], pair_skeleton(st["reactants"])),
-                                  []).append(st)
+            if not st["problem"] and not st["kind"].startswith("weak"):
+                groups.setdefault((st["source"], st["direction"],
+                                   pair_skeleton(st["reactants"])), []).append(st)
         for grp in groups.values():
             low = min(st["Ea"] for st in grp)
             first = True
@@ -627,18 +678,19 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None):
     return sorted(steps, key=lambda st: (st["Ea"] is None, st["Ea"] or 0))
 
 
-def reasonable_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None):
+def reasonable_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None,
+                     reverse=False):
     """The NEB pathways a network search may use (see all_steps)."""
-    return [st for st in all_steps(db, max_ea, keep, ea_tol, model, weak_max)
+    return [st for st in all_steps(db, max_ea, keep, ea_tol, model, weak_max, reverse)
             if not st["problem"]]
 
 
 def print_step_report(db, max_ea, states, name, keep="best", ea_tol=0.1, model=None,
-                      weak_max=None):
+                      weak_max=None, reverse=False):
     """Why each step in the database was or wasn't usable."""
     reached = {k for sk in states for k, _ in sk}
     rows = []
-    for st in all_steps(db, max_ea, keep, ea_tol, model, weak_max):
+    for st in all_steps(db, max_ea, keep, ea_tol, model, weak_max, reverse):
         why = st["problem"]
         if not why:
             need = Counter(skeleton(x) for x in st["reactants"])
@@ -1155,23 +1207,37 @@ def cmd_network(args):
               f"steps kept per pair run: {args.steps}"
               + (f" (within {args.ea_tol} eV)" if args.steps == "tol" else "") + "; "
               f"at most {args.max_runs} new pair run(s)")
+        print("  direction : " + ("forward, plus pair runs from the product side "
+                                  "(steps used in both directions)" if args.reverse
+                                  else "forward only"))
         ra, pa = atom_counts(reactants), atom_counts(products)
         if ra != pa:
-            print(f"  WARNING   : overall reaction is not balanced "
-                  f"({dict(ra)} vs {dict(pa)})")
+            fix = suggest_balance(reactants, products)
+            sys.exit(f"error: overall reaction is not balanced ({dict(ra)} vs "
+                     f"{dict(pa)}), so no mechanism can complete it"
+                     + (f"; did you mean: {fix}" if fix else ""))
         if not targets:
             sys.exit("error: nothing to make (all products are also reactants)")
 
+        rtargets = sorted(set(reactants) - set(products))
         runs, tried, route, said = 0, set(), None, set()
         while True:
             name = dict(base_name)
-            steps = flask_steps(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model, weak_max), name)
+            steps = flask_steps(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol,
+                                                 use_model, weak_max, args.reverse), name)
             for x in products:
                 name.setdefault(skeleton(x), x)
             states, truncated = explore(start, steps, args.max_states)
             if truncated:
                 log(f"WARNING: stopped exploring at --max-states ({args.max_states})")
             depth = flask_depths(start, states, steps)
+            # product side: flasks reachable from the overall products with the
+            # same (two-way) steps, i.e. ones that lead *to* the products
+            if args.reverse:
+                states_b, _ = explore(goal, steps, args.max_states)
+                depth_b = flask_depths(goal, states_b, steps)
+            else:
+                states_b, depth_b = {}, {}
             done = [sk for sk in states
                     if all(dict(sk).get(k, 0) >= v for k, v in goal.items())]
             reached = {k for sk in states for k, _ in sk}
@@ -1196,6 +1262,10 @@ def cmd_network(args):
                     "amounts at once; continuing")
             if args.propose:
                 props = proposals(db, depth, goal, name, args.model)
+                if args.reverse:  # product-side pair -> exactly the missing reactants
+                    sigs = {x[3] for x in props}
+                    props += [x for x in proposals(db, depth_b, start, name, args.model)
+                              if x[3] not in sigs]
                 if props:
                     banner(f"proposed steps from the overall equation: {len(props)}", "-")
                     for _, reac, prod, sig in props:
@@ -1218,8 +1288,8 @@ def cmd_network(args):
                                                         else f" ({rec.get('reason')})"))
                     continue  # re-explore with whatever the proposals gave
             if args.decompose != "none":
-                decs = decompositions(db, states, start, goal, name, args.model,
-                                      steps, args.decompose)
+                decs = decompositions(db, {**states, **states_b}, start, goal, name,
+                                      args.model, steps, args.decompose)
                 if decs:
                     banner(f"decompositions of reachable species: {len(decs)}", "-")
                     for x, prod, sig in decs:
@@ -1232,6 +1302,18 @@ def cmd_network(args):
                                                         else f" ({rec.get('reason')})"))
                     continue  # re-explore with the new unimolecular steps
             fp = flask_pairs(states, depth, goal)
+            side = dict.fromkeys(fp, "reactant")
+            if args.reverse:
+                for k, v in flask_pairs(states_b, depth_b, start).items():
+                    if k not in fp or v[0] < fp[k][0]:
+                        fp[k], side[k] = v, "product"
+
+            def tier_for(a, b):
+                k = tuple(sorted((skeleton(a), skeleton(b))))
+                if side.get(k) == "product":
+                    return make_tier([a, b], depth_b, steps, start, rtargets)
+                return make_tier([a, b], depth, steps, goal, targets)
+
             cands = candidate_pairs(db, fp, name, tried, args.retry_failed,
                                     None if args.any_model else args.model)
             gen = cands[0][0] if cands else None
@@ -1249,7 +1331,7 @@ def cmd_network(args):
                     paths = {i: entry["pathways"][str(i)] for i in ids
                              if str(i) in (entry.get("pathways") or {})}
                     pargs = argparse.Namespace(**vars(args))
-                    tier = make_tier([a, b], depth, steps, goal, targets)
+                    tier = tier_for(a, b)
                     try:
                         os.makedirs(pair_dir, exist_ok=True)
                         with contextlib.redirect_stdout(console), \
@@ -1272,8 +1354,12 @@ def cmd_network(args):
             batch = [c for c in cands if c[0] == gen]
             banner(f"generation {gen}: {len(batch)} pair(s)", "-")
             for _, a, b, _, sk in batch:
-                print(f"  {a} + {b}" + (f"    (from flask {fmt_flask(sk, name)})"
-                                       if gen > 1 else ""))
+                k = tuple(sorted((skeleton(a), skeleton(b))))
+                where = "product side" if side.get(k) == "product" else ""
+                if gen > 1:
+                    where = (where + ", " if where else "") + \
+                        f"from flask {fmt_flask(sk, name)}"
+                print(f"  {a} + {b}" + (f"    ({where})" if where else ""))
             stop = False
             for i, (_, a, b, key, sk) in enumerate(batch):
                 if runs >= args.max_runs:
@@ -1287,9 +1373,10 @@ def cmd_network(args):
                 pargs = argparse.Namespace(**vars(args))
                 pargs.smiles1, pargs.smiles2, pargs.dir = a, b, None
                 if args.focus:
-                    pargs.focus = make_tier([a, b], depth, steps, goal, targets)
+                    pargs.focus = tier_for(a, b)
                 pair_dir = os.path.join(directory, pair_dirname(key))
-                n_before = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model, weak_max))
+                n_before = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model, weak_max,
+                                            args.reverse))
                 try:
                     with contextlib.redirect_stdout(console):  # details -> pair log
                         run_pair(pargs, db, key, pair_dir, suggest=False)
@@ -1299,7 +1386,8 @@ def cmd_network(args):
                 entry = get_entry(db, key)
                 log(f"done -> {pair_dir}/arcskin.log")
                 print_best(entry.get("best_pathways") or [])
-                new = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model, weak_max)) - n_before
+                new = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model, weak_max,
+                                            args.reverse)) - n_before
                 log(f"{new} new usable step(s)")
             if stop:
                 break
@@ -1317,7 +1405,7 @@ def cmd_network(args):
             print("  try raising --max-ea / --max-runs / --scale, or --retry-failed")
             section("steps in the database")
             print_step_report(db, args.max_ea, states, name, args.steps, args.ea_tol,
-                              use_model, weak_max)
+                              use_model, weak_max, args.reverse)
             networks.upsert(jsanitize({"overall": overall, "status": "not found",
                                        "reachable": sorted(name.get(k, k) for k in reached),
                                        "updated": now()}),
@@ -1573,6 +1661,10 @@ def main(argv=None):
     w.add_argument("--no-propose", dest="propose", action="store_false",
                    help="don't NEB steps suggested by the overall equation "
                    "(A + B -> exactly the missing products) before nanoreactor runs")
+    w.add_argument("--no-reverse", dest="reverse", action="store_false",
+                   help="search forward only: don't use NEB steps backwards "
+                   "(Ea_rev = Ea - dE) or run pairs from the product side "
+                   "(e.g. HONO + HNO3 for 2 NO2 + H2O -> HONO + HNO3)")
     w.add_argument("--decompose", choices=["intermediates", "all", "none"],
                    default="intermediates",
                    help="NEB unimolecular decompositions X -> A + B (every "
