@@ -57,6 +57,81 @@ def freq_report(images, E, fr_r, fr_p, m_r, m_p, charge, mult, calc, band_calc,
     return out
 
 
+def needs_envelope(m_r, m_p, mult, spin_ok):
+    """Run the band on the lower of two spin states only where one fixed
+    state can't describe it: a low-spin (singlet) band in which radicals form
+    or recombine (aimnet2nse's singlet is closed-shell, e.g. N2O5 -> NO2 + NO3),
+    or a spin-forbidden reaction (lets the band cross between surfaces).
+    A band that fits one surface (O2(triplet) + H2 -> 2 OH on the triplet) stays
+    on it, so images don't hop between states."""
+    if not spin_ok:
+        return True
+    radicals = max(sum(m > 1 for m in m_r), sum(m > 1 for m in m_p))
+    return mult == 1 and radicals >= 2
+
+
+BAND_KEYS = ("converged", "Ea_iso", "Ea_rev_iso", "E_ts_iso", "well", "intermediates",
+             "band_flags")
+
+
+def analyse_band(images, E, path, image_mults, converged, overall, tol=0.1):
+    """Quality checks of a finished band (energies E relative to image 0, path
+    the cumulative distance along it, in Å), and the barrier measured from the
+    separated (isolated, relaxed) reactants and products:
+
+      Ea_iso / Ea_rev_iso : highest image - sum of isolated reactant / product
+                            energies (comparable between pathways, unlike Ea,
+                            which starts from the packed reactant complex)
+      well                : how far the band drops below its reactant end before
+                            the barrier (a bound pre-reactive complex, or an
+                            end that wasn't the lowest arrangement)
+      intermediates       : interior minima lower than both ends: the band runs
+                            through a stable intermediate (two steps in one)
+      band_flags          : human-readable warnings"""
+    E = np.asarray(E, float)
+    x = np.asarray(path, float)
+    top = int(np.argmax(E))
+    flags = []
+    out = {"converged": converged, "Ea_iso": None, "Ea_rev_iso": None, "E_ts_iso": None,
+           "well": float(E[:top + 1].min()), "intermediates": [], "band_flags": flags}
+    if converged is False:
+        flags.append("band not converged")
+    if out["well"] < -tol:
+        flags.append(f"drops {-out['well']:.2f} eV below the reactant end before the "
+                     f"barrier (bound complex; barrier from it is "
+                     f"{E[top] - out['well']:.2f} eV)")
+    for k in range(1, len(E) - 1):
+        if E[k] < E[k - 1] and E[k] <= E[k + 1] and E[k] < min(E[0], E[-1]) - tol:
+            # a barrier on both sides (a dip right after the reactant end is
+            # the pre-reactive complex, reported as `well`)
+            if E[:k].max() > max(E[0], E[k]) + tol and E[k + 1:].max() > E[k] + tol:
+                out["intermediates"].append({"image": k, "E": float(E[k])})
+    if out["intermediates"]:
+        flags.append("intermediate(s) along the band at image(s) "
+                     + ", ".join(f"{m['image']} ({m['E']:+.2f} eV)"
+                                 for m in out["intermediates"])
+                     + ": more than one elementary step; Ea is not a single barrier")
+    gaps = np.diff(x)
+    if len(gaps) and (gaps.min() < 0.05 or gaps.max() > 4 * max(np.median(gaps), 1e-3)):
+        flags.append(f"uneven images (spacing {gaps.min():.2f}-{gaps.max():.2f} Å; "
+                     f"try more --n-images)")
+    if image_mults:
+        hops = sum(a != b for a, b in zip(image_mults, image_mults[1:]))
+        if hops > 1:
+            flags.append(f"spin state changes {hops} times along the band")
+    try:
+        e_abs = np.array([im.info["energy"] for im in images], float)
+        er = float(np.sum(overall["reactants_energies"]))
+        ep = float(np.sum(overall["products_energies"]))
+        if np.isfinite(er) and np.isfinite(ep):
+            out["E_ts_iso"] = float(e_abs.max())
+            out["Ea_iso"] = float(e_abs.max() - er)
+            out["Ea_rev_iso"] = float(e_abs.max() - ep)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return out
+
+
 MIN_PATH = 0.5  # Å; shorter bands mean the endpoints are (nearly) the same structure
 
 
@@ -101,6 +176,7 @@ def run_neb(
     method="idpp",
     trajectory=None,
     logfile="-",
+    stats=None,
 ):
     """Interpolate (IDPP), relax the band, then switch on climbing image.
     `calc` is either one calculator shared by all images (e.g. MACE) or a factory
@@ -124,6 +200,8 @@ def run_neb(
         converged = opt.run(fmax=fmax, steps=steps)
     if not converged:
         warnings.warn(f"NEB not converged to fmax={fmax} in {steps} steps")
+    if stats is not None:
+        stats["converged"] = bool(converged)
     for im in images:  # keep energy/forces with each image (for trajectories.json)
         im.info["energy"] = float(im.get_potential_energy())
         im.set_array("forces", np.array(im.get_forces()))
@@ -209,6 +287,7 @@ def determine_best(results):
             "spin_envelope": results[i].get("spin_envelope"),
             "image_mults": results[i].get("image_mults"),
             "freq": results[i].get("freq"),
+            **{k: results[i].get(k) for k in BAND_KEYS},
         }
     ranking = pd.DataFrame(new_results).T.sort_values(by=["Ea", "dE"], ascending=True)
     return ranking
@@ -296,12 +375,14 @@ def run_all(
             set_state(reactants, charge, mult)
             set_state(products, charge, mult)
         band_calc, env = calc, None
-        if spin_envelope and m_r is not None and is_nse(calc):
+        if (spin_envelope and m_r is not None and is_nse(calc)
+                and needs_envelope(m_r, m_p, mult, spin_ok)):
             env = envelope_mults(m_r, m_p)
             if len(env) > 1:
                 band_calc = SpinEnvelope(calc, env)
             else:
                 env = None
+        stats = {}
         images, E, Ea, dE = run_neb(
             reactants,
             products,
@@ -312,6 +393,7 @@ def run_all(
             steps=steps,
             trajectory=trajectory,
             logfile=logfile,
+            stats=stats,
         )
         fit = forcecurve.fit_images(images)
         path_length = float(np.max(fit.path))
@@ -325,6 +407,8 @@ def run_all(
                 band_calc.get_potential_energy(im)
                 image_mults.append(band_calc.mult)
                 im.info["band_mult"] = band_calc.mult
+        band = analyse_band(images, E, fit.path, image_mults, stats.get("converged"),
+                            v["overall"])
         if not spin_ok:
             reason = (reason + "; " if reason else "") + (
                 f"spin-forbidden: reactant spins {m_r} can't couple to the "
@@ -363,6 +447,7 @@ def run_all(
             "spin_envelope": env,
             "image_mults": image_mults,
             "freq": freq_res,
+            **band,
         }
 
     results = determine_best(results)

@@ -316,11 +316,15 @@ def neb_records(args, paths):
     table([(r["pathway"], fmt_rxn(r["reactants"], r["products"]),
             fnum(r["Ea"]), fnum(r["dE"]), r.get("mult"),
             "weak" if weak_complex(r, WEAK_MAX) is not None else bool(r["sane"]),
-            kind_label(r)) + ((freq_label(r.get("freq")),) if freq else ())
-           + (weak_note(r) or r.get("reason") or "",)
+            kind_label(r), fnum(r.get("Ea_iso")))
+           + ((freq_label(r.get("freq")),) if freq else ())
+           + ("; ".join(x for x in [weak_note(r) or r.get("reason") or ""]
+                        + list(r.get("band_flags") or []) if x),)
            for _, r in ranking.sort_values("Ea").iterrows()],
-          ["#", "pathway", "Ea/eV", "dE/eV", "mult", "sane", "kind"]
+          ["#", "pathway", "Ea/eV", "dE/eV", "mult", "sane", "kind", "Ea(sep)/eV"]
           + (["freq R | P | TS"] if freq else []) + ["note"])
+    print("  Ea from the packed reactant complex (image 0); Ea(sep) from the "
+          "separated, relaxed reactants")
     return new
 
 
@@ -497,6 +501,48 @@ def record_products(db, key):
     weak = weak_products(entry)
     if weak:
         add_compounds(db, key, weak, "product")
+
+
+def print_pair_outcome(db, key, max_ea, keep="best", ea_tol=0.1, model=None,
+                       weak_max=WEAK_MAX, reverse=True, max_reactants=None):
+    """What a pair run found, whatever the barriers: the species the
+    nanoreactor saw and every NEB (both directions) with its Ea, dE and why
+    the network search can or can't use it (e.g. Ea above --max-ea)."""
+    entry = get_entry(db, key) or {}
+    reac = {skeleton(x) for x in entry.get("smiles") or key.split(".")}
+    counts = entry.get("species_counts") or {}
+    seen = sorted(((x, n) for x, n in counts.items() if skeleton(x) not in reac),
+                  key=lambda kv: -kv[1])
+    print("  observed  : " + (", ".join(f"{x} ({n})" for x, n in seen[:10])
+                              + (f", ... {len(seen) - 10} more" if len(seen) > 10 else "")
+                              if seen else "only the reactants (no reaction in the MD)"))
+    paths = entry.get("pathways") or {}
+    if not paths:
+        print("  pathways  : none - nothing to NEB"
+              + ("" if seen else " (try a higher --temperature or longer --time)"))
+        return
+    rows = []
+    for st in all_steps(db, max_ea if max_ea is not None else float("inf"), keep,
+                        ea_tol, model, weak_max, reverse, max_reactants):
+        if st["source"] != key:
+            continue
+        rows.append((st["pathway"], st["direction"][:3],
+                     fmt_rxn(st["reactants"], st["products"]),
+                     fnum(st["Ea"]), fnum(st["dE"]), st["kind"],
+                     st["problem"] or "usable"))
+    rows.sort(key=lambda r: (str(r[0]), r[1] != "for"))
+    if rows:
+        table(rows, ["#", "dir", "reaction", "Ea/eV", "dE/eV", "kind", "status"])
+    run = {str(r[0]) for r in rows}
+    held = [k for k in paths if str(k) not in run]
+    if held:
+        print(f"  not NEB'd : {len(held)} pathway(s) "
+              + ("(deferred: lower priority for this search; run later if needed, "
+                 "or `arcskin neb` them)" if entry.get("deferred") else ""))
+        for k in sorted(held, key=str)[:10]:
+            v = paths[k]
+            print(f"    {k}: {fmt_rxn(v['reactants'], v['products'])}  "
+                  f"(dE isolated {fnum(v.get('diff'))} eV)")
 
 
 def print_best(best):
@@ -869,7 +915,8 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None,
             elif bind is not None:
                 st.update(Ea=0.0, dE=bind, kind="weak complex", problem="")
             elif not st["problem"] and not r.get("sane"):
-                st["problem"] = f"not sane ({r.get('kind') or 'old check'})"
+                why = (r.get("reason") or r.get("kind") or "old check").split(";")[0]
+                st["problem"] = f"not sane: {why[:70]}"
             if not st["problem"]:
                 try:
                     ra, pa = atom_counts(st["reactants"]), atom_counts(st["products"])
@@ -1667,10 +1714,13 @@ def cmd_network(args):
                     continue
                 entry = get_entry(db, key)
                 log(f"done -> {pair_dir}/arcskin.log")
-                print_best(entry.get("best_pathways") or [])
                 new = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model, weak_max,
                                             args.reverse, max_reactants)) - n_before
-                log(f"{new} new usable step(s)")
+                with run_log(os.path.join(pair_dir, "arcskin.log")):  # also in the pair log
+                    section(f"outcome for the network search ({overall})")
+                    print_pair_outcome(db, key, args.max_ea, args.steps, args.ea_tol,
+                                       use_model, weak_max, args.reverse, max_reactants)
+                    log(f"{new} new usable step(s)")
             if stop:
                 break
 
@@ -1898,7 +1948,11 @@ def cmd_batch(args):
                 results.append((gen, a, b, "run", entry))
                 gen_entries.append(entry)
                 log(f"done -> {pair_dir}/arcskin.log")
-                print_best(entry.get("best_pathways") or [])
+                with run_log(os.path.join(pair_dir, "arcskin.log")):
+                    section("outcome")
+                    print_pair_outcome(db, key, getattr(args, "product_max_ea", None)
+                                       or float("inf"), model=args.model,
+                                       weak_max=WEAK_MAX)
 
             if stop_reason:
                 break
