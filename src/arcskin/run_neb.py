@@ -57,6 +57,31 @@ def freq_report(images, E, fr_r, fr_p, m_r, m_p, charge, mult, calc, band_calc,
     return out
 
 
+def no_interior_barrier(E, diff, kind, tol=0.02):
+    """(Ea, dE, note) when a band has no maximum between its ends, else None.
+
+    If the energy just rises to the product end (or falls from the start),
+    there is no barrier beyond the reaction energy, and the band's Ea is only
+    the energy of the packed product (or reactant) complex, which depends on
+    how the molecules happen to be placed (two spellings of NO2 gave 1.61 and
+    1.80 eV for 2 NO2 -> 2 NO + O2; the separated species give 1.16, expt.
+    ~1.18). Then Ea = max(dE, 0) and dE = the reaction energy of the separated
+    species (`diff`)."""
+    try:
+        d = float(diff)
+    except (TypeError, ValueError):
+        return None
+    E = np.asarray(E, float)
+    end = 0 if E[0] >= E[-1] else len(E) - 1
+    top = end if E.max() - E[end] < tol else int(np.argmax(E))
+    if not np.isfinite(d) or kind not in ("barrier", "unchecked") or 0 < top < len(E) - 1:
+        return None
+    return (max(d, 0.0), d,
+            f"no maximum between the ends: Ea = reaction energy of the separated "
+            f"species ({d:+.3f} eV), not the packed {'product' if top else 'reactant'} "
+            f"end ({E[top]:+.3f} eV)")
+
+
 def needs_envelope(m_r, m_p, mult, spin_ok):
     """Run the band on the lower of two spin states only where one fixed
     state can't describe it: a low-spin (singlet) band in which radicals form
@@ -349,12 +374,25 @@ def run_all(
         set_state(products, charge, mult)
         mult = reactants.info["mult"]
 
-        reactants = relax(reactants, calc)
+        band_calc, env = calc, None
+        if (spin_envelope and m_r is not None and is_nse(calc)
+                and needs_envelope(m_r, m_p, mult, spin_ok)):
+            env = envelope_mults(m_r, m_p)
+            if len(env) > 1:
+                band_calc = SpinEnvelope(calc, env)
+            else:
+                env = None
+        # relax the reactant end on the same spin treatment as the band: two
+        # radicals side by side relaxed on the closed-shell singlet end up
+        # wherever the starting geometry sends them (so e.g. O=[N+][O-] and
+        # [O]N=O gave different "reactant" energies and Ea 0.45-5.7 eV for the
+        # same NO2 + NO2 step)
+        reactants = relax(reactants, band_calc)
         if separate_products and m_p is not None:
             products = relax_fragments(products, fr_p, m_p, calc)
             set_state(products, charge, mult)  # back to the system's state
         else:
-            products = relax(products, calc)
+            products = relax(products, band_calc)
         pushed = []
         if freq and m_r is not None:
             # make every end molecule a true minimum before the band is run
@@ -371,17 +409,9 @@ def run_all(
                                                        atoms.positions[idx])[0]
                         pushed.append(f"{names[i]} ({side[:-1]})")
             if pushed and len(fr_r) > 1:
-                reactants = relax(reactants, calc)  # complex around the new shapes
+                reactants = relax(reactants, band_calc)  # complex around the new shapes
             set_state(reactants, charge, mult)
             set_state(products, charge, mult)
-        band_calc, env = calc, None
-        if (spin_envelope and m_r is not None and is_nse(calc)
-                and needs_envelope(m_r, m_p, mult, spin_ok)):
-            env = envelope_mults(m_r, m_p)
-            if len(env) > 1:
-                band_calc = SpinEnvelope(calc, env)
-            else:
-                env = None
         stats = {}
         images, E, Ea, dE = run_neb(
             reactants,
@@ -409,6 +439,11 @@ def run_all(
                 im.info["band_mult"] = band_calc.mult
         band = analyse_band(images, E, fit.path, image_mults, stats.get("converged"),
                             v["overall"])
+        fix = no_interior_barrier(E, v["overall"].get("diff"), kind)
+        if fix is not None:
+            Ea, dE, note = fix
+            band["Ea_iso"], band["Ea_rev_iso"] = Ea, max(-dE, 0.0)
+            reason = (reason + "; " if reason else "") + note
         if not spin_ok:
             reason = (reason + "; " if reason else "") + (
                 f"spin-forbidden: reactant spins {m_r} can't couple to the "

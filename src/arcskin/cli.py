@@ -2199,6 +2199,63 @@ def cmd_freq(args):
             print(f"  structure  -> {out}")
 
 
+def cmd_steps(args):
+    """List, or rerun (NEB only), the single-NEB steps stored in the
+    'proposals' table: proposed steps (A + B -> missing products) and
+    decompositions (X -> A + B). Rerunning replaces the stored NEB."""
+    db = open_db(args)
+    origins = [o for o, on in (("proposed", args.proposed), ("decomposed", args.decomposed))
+               if on] or ["proposed", "decomposed"]
+    want = skeleton(args.containing) if args.containing else None
+    sel = []
+    for d in db.table("proposals").all():
+        if d.get("origin", "proposed") not in origins:
+            continue
+        if not args.any_model and d.get("model") != args.model:
+            continue
+        if want and want not in {skeleton(x) for x in d["reactants"] + d["products"]}:
+            continue
+        sel.append(d)
+    sel.sort(key=lambda d: (d.get("origin", "proposed"), fmt_rxn(d["reactants"], d["products"])))
+
+    def row(i, d):
+        r = d.get("neb") or {}
+        return (i, d.get("origin", "proposed"), fmt_rxn(d["reactants"], d["products"]),
+                fnum(r.get("Ea")), fnum(r.get("dE")), r.get("kind") or "failed",
+                d.get("model"), "; ".join(r.get("band_flags") or []) or
+                ("" if r else (d.get("error") or "")[:60]))
+
+    head = ["#", "origin", "reaction", "Ea/eV", "dE/eV", "kind", "model", "notes"]
+    if not args.run:
+        if sel:
+            table([row(i, d) for i, d in enumerate(sel)], head)
+        else:
+            print("no stored steps match")
+        print("\nrerun with: arcskin steps --run [--ids 0 3] [--proposed | --decomposed] "
+              "[--containing SMILES]")
+        return
+    if args.ids:
+        sel = [sel[i] for i in args.ids if 0 <= i < len(sel)]
+    directory = args.dir or "."
+    os.makedirs(directory, exist_ok=True)
+    console = sys.stdout
+    done = []
+    for i, d in enumerate(sel):
+        origin = d.get("origin", "proposed")
+        reac, prod = list(d["reactants"]), list(d["products"])
+        log(f"[{i + 1}/{len(sel)}] NEB {fmt_rxn(reac, prod)}  ({origin})")
+        tag = slug(reac[0]) if origin == "decomposed" else reaction_slug(reac, prod)
+        try:
+            with contextlib.redirect_stdout(console):
+                run_proposal(args, db, reac, prod, d["sig"], directory, tag, origin=origin)
+        except Exception as e:
+            log(f"FAILED: {e}")
+        done.append(db.table("proposals").get((Query().sig == d["sig"])
+                                               & (Query().model == args.model)) or d)
+    section("rerun steps")
+    table([row(i, d) for i, d in enumerate(done)], head)
+
+
 def cmd_show(args):
     entry = get_entry(TinyDB(args.db), reaction_key(args.smiles1, args.smiles2))
     if not entry:
@@ -2383,6 +2440,20 @@ def main(argv=None):
     nb.add_argument("--dir", help="where the pair directory is, if not recorded")
     run_options(nb)
     nb.set_defaults(func=cmd_neb)
+
+    sp = sub.add_parser("steps", help="list or rerun (NEB only) the stored proposed "
+                        "steps and decompositions")
+    sp.add_argument("--run", action="store_true", help="rerun the NEBs (default: list)")
+    sp.add_argument("--ids", type=int, nargs="+", help="only these (numbers from the list)")
+    sp.add_argument("--proposed", action="store_true", help="only proposed steps")
+    sp.add_argument("--decomposed", action="store_true", help="only decompositions")
+    sp.add_argument("--containing", metavar="SMILES",
+                    help="only steps with this species on either side")
+    sp.add_argument("--any-model", action="store_true",
+                    help="also steps computed with other models (rerun with --model)")
+    sp.add_argument("--dir", help="where proposed/ and decomposed/ logs go (default: .)")
+    run_options(sp)
+    sp.set_defaults(func=cmd_steps)
 
     fq = sub.add_parser("freq", help="relax species and check they are true minima "
                         "(harmonic frequencies)")
