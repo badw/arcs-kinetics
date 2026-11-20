@@ -1401,11 +1401,22 @@ def cmd_network(args):
                     log(f"next pairs are generation {gen} > --max-generations "
                         f"({args.max_generations}); stopping")
                 break
-            batch = [c for c in cands if c[0] == gen]
-            banner(f"generation {gen}: {len(batch)} pair(s)", "-")
+            # alternate reactant-side and product-side pairs (reactant side
+            # first), so both directions get explored even if --max-runs
+            # stops the generation part-way
+            def pside(c):
+                return side.get(tuple(sorted((skeleton(c[1]), skeleton(c[2])))))
+
+            fw = [c for c in cands if c[0] == gen and pside(c) != "product"]
+            pw = [c for c in cands if c[0] == gen and pside(c) == "product"]
+            batch = [c for two in itertools.zip_longest(fw, pw) for c in two if c]
+            banner(f"generation {gen}: {len(batch)} pair(s)"
+                   + (f" ({len(fw)} reactant side, {len(pw)} product side)"
+                      if args.reverse else ""), "-")
             for _, a, b, _, sk in batch:
                 k = tuple(sorted((skeleton(a), skeleton(b))))
-                where = "product side" if side.get(k) == "product" else ""
+                where = ("product side" if side.get(k) == "product"
+                         else "reactant side" if args.reverse else "")
                 if gen > 1:
                     where = (where + ", " if where else "") + \
                         f"from flask {fmt_flask(sk, name)}"
