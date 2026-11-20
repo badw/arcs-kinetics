@@ -119,7 +119,8 @@ def best_pathways(ranking, ea_tol):
     sane = ranking[ranking["sane"].astype(bool)]
     pool = sane if len(sane) else ranking
     best = pool[pool["Ea"] <= pool["Ea"].min() + ea_tol]
-    cols = ["pathway", "reactants", "products", "Ea", "dE", "sane", "kind", "reason"]
+    cols = ["pathway", "reactants", "products", "Ea", "dE", "diff", "sane", "kind",
+            "reason"]
     return [{c: row.get(c) for c in cols} for _, row in best.iterrows()]
 
 
@@ -288,7 +289,7 @@ def neb_records(args, paths):
     new = ranking.to_dict("records")
     table([(r["pathway"], fmt_rxn(r["reactants"], r["products"]),
             fnum(r["Ea"]), fnum(r["dE"]), r.get("mult"), bool(r["sane"]),
-            r.get("kind"), r.get("reason") or "")
+            kind_label(r), r.get("reason") or "")
            for _, r in ranking.sort_values("Ea").iterrows()],
           ["#", "pathway", "Ea/eV", "dE/eV", "mult", "sane", "kind", "note"])
     return new
@@ -396,10 +397,8 @@ def run_pipeline(args, db, key, directory, suggest=True):
             deferred = []
         save(db, key, deferred=deferred)
 
+    record_products(db, key)
     best = (get_entry(db, key) or {}).get("best_pathways") or []
-    for b in best:  # only what NEB says is the outcome, not every candidate
-        if b.get("sane"):
-            add_compounds(db, key, b["products"], "product")
     save(db, key, status="complete")
 
     # summary
@@ -418,12 +417,56 @@ def run_pipeline(args, db, key, directory, suggest=True):
     print()
 
 
+WEAK_MAX = 0.15  # eV; default --weak-max
+
+
+def kind_label(r, weak_max=WEAK_MAX):
+    """NEB kind, with unbound associations that are weakly bound complexes
+    (e.g. the NO dimer) shown as such."""
+    bind = weak_complex(r, weak_max)
+    if bind is not None:
+        return f"weak complex ({bind:+.3f} eV)"
+    return r.get("kind") or ""
+
+
+def weak_pick(records, weak_max=WEAK_MAX):
+    """The one weak complex to keep from a pair run's NEB records, or None.
+
+    Unbound associations of one pair are usually the same loose complex in
+    different orientations (NO + NO gives O=NN=O, [N]O[N][O], a ring, ... that
+    all fall apart to the same NO...NO pair), so only one is kept: the most
+    closed-shell spelling (O=NN=O), then the most strongly bound."""
+    weak = [r for r in records or [] if weak_complex(r, weak_max) is not None]
+    if not weak:
+        return None
+    return min(weak, key=lambda r: (spelling_score(r["products"][0]),
+                                    weak_complex(r, weak_max)))
+
+
+def weak_products(entry, weak_max=WEAK_MAX):
+    """Product of the weakly bound complex kept from an entry (see weak_pick)."""
+    r = weak_pick((entry or {}).get("neb"), weak_max)
+    return list(r["products"]) if r else []
+
+
+def record_products(db, key):
+    """Add an entry's outcome to the compounds table: products of its sane best
+    pathways and of any weakly bound complexes (e.g. O=NN=O from NO + NO)."""
+    entry = get_entry(db, key) or {}
+    for b in entry.get("best_pathways") or []:  # what NEB says is the outcome
+        if b.get("sane"):
+            add_compounds(db, key, b["products"], "product")
+    weak = weak_products(entry)
+    if weak:
+        add_compounds(db, key, weak, "product")
+
+
 def print_best(best):
     if not best:
         print("  no pathway found")
         return
     table([(b["pathway"], fmt_rxn(b["reactants"], b["products"]),
-            fnum(b["Ea"]), fnum(b["dE"]), b.get("kind") or "") for b in best],
+            fnum(b["Ea"]), fnum(b["dE"]), kind_label(b)) for b in best],
           ["#", "pathway", "Ea/eV", "dE/eV", "kind"])
 
 
@@ -520,14 +563,28 @@ def run_pair(args, db, key, directory, suggest=True):
     """Run the pipeline for args.smiles1 + args.smiles2 with a log in `directory`."""
     os.makedirs(directory, exist_ok=True)
     logfile = os.path.join(directory, "arcskin.log")
+    before = get_entry(db, key)
     with run_log(logfile):
         try:
             run_pipeline(args, db, key, directory, suggest=suggest)
-        except Exception as e:
-            save(db, key, status=f"failed: {e}")
+        except BaseException as e:  # incl. Ctrl-C
+            restore_or_fail(db, key, before, e)
             raise
         finally:
             print(f"log written to {logfile}")
+
+
+def restore_or_fail(db, key, before, err):
+    """After a run dies: put back a previously complete entry (so a --force
+    rerun that is interrupted doesn't lose the old results), otherwise mark
+    the entry failed (so it isn't left at 'running' and skipped forever)."""
+    if before and before.get("status") == "complete":
+        db.remove(Query().key == key)
+        db.insert(before)
+        print(f"run stopped ({type(err).__name__}); previous results restored")
+    else:
+        why = "interrupted" if isinstance(err, KeyboardInterrupt) else err
+        save(db, key, status=f"failed: {why}")
 
 
 # --------------------------------------------------------------------------
@@ -706,6 +763,21 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None,
                         and x["Ea"] > max_ea):
                     x["problem"] = f"Ea > {max_ea}"
                 steps.append(x)
+    # one weak complex per pair run (see weak_pick); same pathway both ways
+    chosen = {}
+    for st in steps:
+        if st["kind"] == "weak complex" and not st["problem"]:
+            k = (st["source"], pair_skeleton(st["reactants"]))
+            score = (spelling_score(st["products"][0]), st["dE"])
+            if k not in chosen or score < chosen[k][0]:
+                chosen[k] = (score, st["pathway"])
+    for st in steps:
+        if st["kind"].startswith("weak") and not st["problem"]:
+            rs = st["reactants"] if st["kind"] == "weak complex" else st["products"]
+            pick = chosen.get((st["source"], pair_skeleton(rs)))
+            if pick and pick[1] != st["pathway"]:
+                st["problem"] = (f"same loose complex as pathway {pick[1]} "
+                                 f"(one weak complex kept per run)")
     if keep != "all":
         groups = {}
         for st in steps:
@@ -1557,7 +1629,8 @@ def batch_products(entries, known, max_ea=None, stable_only=False):
     where rows = (product, from pair, Ea) for the log."""
     spellings, origin = {}, {}
     for entry in entries:
-        for bp in (entry or {}).get("best_pathways") or []:
+        weak = [{"sane": True, "Ea": 0.0, "products": [x]} for x in weak_products(entry)]
+        for bp in ((entry or {}).get("best_pathways") or []) + weak:
             if not bp.get("sane"):
                 continue
             try:
@@ -1771,6 +1844,96 @@ def cmd_suggest(args):
                                     containing=args.containing))
 
 
+def _pid(k):
+    return int(k) if str(k).isdigit() else k
+
+
+def cmd_neb(args):
+    """Rerun the NEB for a pair from its stored nanoreactor analysis (no MD, no
+    analysis), or NEB A + B -> any products you give (e.g. a species the
+    nanoreactor found). Results replace that pathway's old NEB, the best
+    pathways are recomputed and the entry is marked complete."""
+    db = TinyDB(args.db)
+    key = reaction_key(args.smiles1, args.smiles2)
+    entry = get_entry(db, key)
+    if not entry or not (entry.get("pathways") or args.products):
+        sys.exit(f"no nanoreactor analysis stored for {key}; run `arcskin run "
+                 f"{args.smiles1} {args.smiles2}` first (or give --products)")
+    paths = {str(k): v for k, v in (entry.get("pathways") or {}).items()}
+    old = {str(r.get("pathway")): r for r in entry.get("neb") or []}
+
+    if args.list or not (args.pathways or args.products or args.all):
+        print(f"{key}  (status: {entry.get('status')}, model: {entry_model(entry)})")
+        counts = entry.get("species_counts") or {}
+        if counts:
+            section("species found by the nanoreactor")
+            table(sorted(counts.items(), key=lambda kv: -kv[1]), ["species", "count"])
+        section("candidate pathways")
+        table([(k, fmt_rxn(v["reactants"], v["products"]), fnum(v.get("diff")),
+                fnum(old[k]["Ea"]) if k in old else "-",
+                kind_label(old[k]) if k in old else "not run")
+               for k, v in sorted(paths.items(), key=lambda kv: str(kv[0]))],
+              ["#", "pathway", "dE(isolated)/eV", "Ea/eV", "NEB"])
+        print("\nrerun with: arcskin neb A B --all | --pathways 0 2 | "
+              "--products SMILES [SMILES ...]")
+        return
+
+    ids = []
+    if args.products:
+        from arcskin.nanoreactor_analysis import AnalyseNanoReactor
+
+        reac = list(entry.get("smiles") or [args.smiles1, args.smiles2])
+        prod = [canon(x, strict=True) for x in args.products]
+        if atom_counts(reac) != atom_counts(prod):
+            sys.exit(f"error: {fmt_rxn(reac, prod)} doesn't balance")
+        same = [k for k, v in paths.items()
+                if pair_skeleton(v["products"]) == pair_skeleton(prod)]
+        if same:
+            ids = same[:1]
+            print(f"that is pathway {ids[0]}; rerunning it")
+        else:
+            anr = AnalyseNanoReactor(model=args.model)
+            path = {"reactants": reac, "products": prod, "origin": "custom",
+                    "reactants_energies": [anr.species_energy(x) for x in reac],
+                    "products_energies": [anr.species_energy(x) for x in prod]}
+            path["diff"] = float(np.sum(path["products_energies"])
+                                 - np.sum(path["reactants_energies"]))
+            new = str(max((int(k) for k in paths if k.isdigit()), default=-1) + 1)
+            paths[new] = path
+            save(db, key, pathways=paths)
+            ids = [new]
+    ids += [str(k) for k in (args.pathways or [])] if not args.all else list(paths)
+    ids = list(dict.fromkeys(ids))
+    missing = [k for k in ids if k not in paths]
+    if missing:
+        sys.exit(f"error: no pathway {', '.join(missing)}; have {', '.join(sorted(paths))}")
+
+    if entry_model(entry) != args.model and entry.get("neb"):
+        if not args.all:
+            sys.exit(f"error: this pair's NEBs were run with {entry_model(entry)}; "
+                     f"use --all to redo every pathway with {args.model}")
+        save(db, key, neb=[], best_pathways=[])
+
+    directory = entry.get("directory") or os.path.join(args.dir or ".", pair_dirname(key))
+    os.makedirs(directory, exist_ok=True)
+    logfile = os.path.join(directory, "arcskin.log")
+    with run_log(logfile):
+        banner(f"NEB rerun: {' + '.join(entry.get('smiles') or [])}  "
+               f"({len(ids)} pathway(s), no nanoreactor)")
+        print(f"  started   : {now()}")
+        print(f"  model     : {args.model}; n_images={args.n_images}, fmax={args.fmax}, "
+              f"spin envelope {'on' if args.spin_envelope else 'off'}, "
+              f"separate products {'on' if args.separate_products else 'off'}")
+        neb_pathways(args, db, key, {_pid(k): paths[k] for k in ids})
+        left = [d for d in (get_entry(db, key).get("deferred") or [])
+                if str(d) not in ids]
+        save(db, key, deferred=left, status="complete", model=args.model)
+        record_products(db, key)
+        section("best pathway(s)")
+        print_best(get_entry(db, key).get("best_pathways") or [])
+        print(f"\nlog written to {logfile}")
+
+
 def cmd_show(args):
     entry = get_entry(TinyDB(args.db), reaction_key(args.smiles1, args.smiles2))
     if not entry:
@@ -1928,6 +2091,22 @@ def main(argv=None):
                    help="rerun decompositions already in the database")
     run_options(d)
     d.set_defaults(func=cmd_decompose)
+
+    nb = sub.add_parser("neb", help="rerun the NEB for a pair from its stored "
+                        "nanoreactor analysis (no MD), or NEB A + B -> given products")
+    nb.add_argument("smiles1")
+    nb.add_argument("smiles2")
+    nb.add_argument("--list", action="store_true",
+                    help="show the species found and the candidate pathways (default "
+                    "when nothing to run is given)")
+    nb.add_argument("--all", action="store_true", help="rerun every candidate pathway")
+    nb.add_argument("--pathways", nargs="+", metavar="ID", help="pathway ids to rerun")
+    nb.add_argument("--products", nargs="+", metavar="SMILES",
+                    help="NEB A + B -> these products (e.g. a species from --list); "
+                    "added as a new pathway")
+    nb.add_argument("--dir", help="where the pair directory is, if not recorded")
+    run_options(nb)
+    nb.set_defaults(func=cmd_neb)
 
     t = sub.add_parser("traj", help="list or export the MD / NEB trajectories "
                        "in a trajectories.json (for ASE)")
