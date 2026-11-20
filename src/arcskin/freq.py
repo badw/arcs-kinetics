@@ -67,19 +67,26 @@ def _external_modes(atoms):
     return u[:, s > 1e-6 * s.max()]  # 5 for linear molecules, 6 otherwise
 
 
-def frequencies(atoms, H):
-    """Vibrational frequencies (cm^-1, imaginary < 0), translations and
-    rotations projected out."""
+def normal_modes(atoms, H):
+    """(frequencies in cm^-1 with imaginary < 0, Cartesian mode vectors
+    (n_modes, N, 3), unit length), translations and rotations projected out."""
     if len(atoms) < 2:
-        return np.array([])
+        return np.array([]), np.zeros((0, len(atoms), 3))
     m = np.repeat(atoms.get_masses(), 3)
     Hm = H / np.sqrt(np.outer(m, m))
     ext = _external_modes(atoms)
     # basis of the internal (vibrational) space: complement of ext
     q, _ = np.linalg.qr(np.hstack([ext, np.eye(len(m))]))
     D = q[:, ext.shape[1]:len(m)]
-    w = np.linalg.eigvalsh(D.T @ Hm @ D)
-    return np.sign(w) * np.sqrt(np.abs(w)) * _CM
+    w, v = np.linalg.eigh(D.T @ Hm @ D)
+    modes = (D @ v).T / np.sqrt(m)  # back to Cartesian displacements
+    modes /= np.linalg.norm(modes, axis=1, keepdims=True)
+    return np.sign(w) * np.sqrt(np.abs(w)) * _CM, modes.reshape(-1, len(atoms), 3)
+
+
+def frequencies(atoms, H):
+    """Vibrational frequencies (cm^-1, imaginary < 0)."""
+    return normal_modes(atoms, H)[0]
 
 
 def check(atoms, calc, threshold=THRESHOLD, delta=0.01):
@@ -90,6 +97,71 @@ def check(atoms, calc, threshold=THRESHOLD, delta=0.01):
     imag = [float(x) for x in nu if x < -threshold]
     return {"freqs": [float(x) for x in nu], "n_imag": len(imag), "imag": imag,
             "lowest": float(nu.min()) if len(nu) else None}
+
+
+def make_minimum(atoms, calc, threshold=THRESHOLD, step=0.15, fmax=0.01,
+                 max_tries=3):
+    """Relax `atoms` (in place, its own charge/mult in info) to a true minimum:
+    while it has imaginary modes, push it along the most negative one and
+    re-relax. Gets molecules off symmetric saddle points that BFGS can't
+    leave by itself (e.g. NO3 stuck at D3h). Returns (check result, number of
+    pushes)."""
+    from ase.optimize import BFGS
+
+    atoms.calc = calc
+    BFGS(atoms, logfile=None).run(fmax=fmax, steps=500)
+    for n in range(max_tries + 1):
+        nu, modes = normal_modes(atoms, hessian(atoms, calc))
+        imag = [float(x) for x in nu if x < -threshold]
+        res = {"freqs": [float(x) for x in nu], "n_imag": len(imag), "imag": imag,
+               "lowest": float(nu.min()) if len(nu) else None}
+        if not imag or n == max_tries:
+            return res, n
+        e0 = atoms.get_potential_energy()
+        mode = modes[int(np.argmin(nu))]
+        best = None
+        for sgn in (1, -1):  # try both directions, keep the lower minimum
+            a = atoms.copy()
+            a.info.update(atoms.info)
+            a.positions += sgn * step * mode / np.abs(mode).max()
+            a.calc = calc
+            BFGS(a, logfile=None).run(fmax=fmax, steps=500)
+            if best is None or a.get_potential_energy() < best.get_potential_energy():
+                best = a
+        if best.get_potential_energy() > e0 - 1e-5:
+            return res, n  # no lower structure found: leave it
+        atoms.positions = best.positions
+    return res, max_tries
+
+
+def smiles_formula(smi):
+    """Element counts of a SMILES (H included), e.g. for matching fragments."""
+    from collections import Counter
+
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles(smi, sanitize=False)
+    if mol is None:
+        return None
+    mol.UpdatePropertyCache(strict=False)
+    c = Counter(a.GetSymbol() for a in mol.GetAtoms())
+    c["H"] += sum(a.GetTotalNumHs() for a in mol.GetAtoms())
+    return +c
+
+
+def label_fragments(atoms, frags, smiles):
+    """SMILES for each fragment (index lists), matched by composition."""
+    from collections import Counter
+
+    left = list(smiles)
+    out = []
+    for idx in frags:
+        comp = Counter(atoms[idx].get_chemical_symbols())
+        hit = next((s for s in left if smiles_formula(s) == comp), None)
+        if hit is not None:
+            left.remove(hit)
+        out.append(hit or atoms[idx].get_chemical_formula())
+    return out
 
 
 def fmt(res):

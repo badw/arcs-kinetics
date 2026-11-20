@@ -309,10 +309,10 @@ def neb_records(args, paths):
     ranking = run_all(endpoints, n_images=args.n_images, climb=True, fmax=args.fmax,
                       model=args.model, separate_products=args.separate_products,
                       spin_envelope=getattr(args, "spin_envelope", True),
-                      freq=getattr(args, "freq", False))
+                      freq=getattr(args, "freq", True))
     ranking = ranking.reset_index(names="pathway")
     new = ranking.to_dict("records")
-    freq = getattr(args, "freq", False)
+    freq = getattr(args, "freq", True)
     table([(r["pathway"], fmt_rxn(r["reactants"], r["products"]),
             fnum(r["Ea"]), fnum(r["dE"]), r.get("mult"),
             "weak" if weak_complex(r, WEAK_MAX) is not None else bool(r["sane"]),
@@ -2194,11 +2194,12 @@ def main(argv=None):
         r.add_argument("--keep-xtb", action="store_true",
                        help="keep the xtb seed_*/ directories (by default they are "
                        "deleted once the MD frames are in trajectories.json)")
-        r.add_argument("--freq", action="store_true",
-                       help="frequency check on every NEB: each reactant/product "
-                       "molecule must have no imaginary mode (else not sane), and "
-                       "the highest image is checked for exactly one (a transition "
-                       "state). ~6N force calls per structure")
+        r.add_argument("--no-freq", dest="freq", action="store_false",
+                       help="skip the frequency check. By default every NEB end "
+                       "molecule is made a true minimum (pushed off symmetric "
+                       "saddle points, e.g. NO3 at D3h) and must have no imaginary "
+                       "mode (else not sane), and the highest image is checked for "
+                       "exactly one (a transition state); a few seconds per pathway")
         r.add_argument("--ea-tol", type=float, default=0.1,
                        help="also suggest pathways with Ea within this of the best (eV)")
 

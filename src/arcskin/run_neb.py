@@ -13,7 +13,8 @@ from ase.utils import forcecurve
 import tqdm
 
 from arcskin.check_endpoints import expected_bonds, geometry_bonds
-from arcskin.freq import check as freq_check, fmt as fmt_freq
+from arcskin.freq import (check as freq_check, fmt as fmt_freq, label_fragments,
+                          make_minimum)
 from arcskin.make_neb_endpoints import _kabsch
 from arcskin.spin import (DEFAULT_MODEL, SpinEnvelope, envelope_mults,
                           fragment_mults, fragments, get_calculator, is_nse,
@@ -35,7 +36,7 @@ def freq_report(images, E, fr_r, fr_p, m_r, m_p, charge, mult, calc, band_calc,
             else:
                 set_state(sub, 0, mults[i] if mults else None)
             r = freq_check(sub, calc, threshold)
-            r["smiles"] = smiles[i] if len(smiles) == len(frags) else sub.get_chemical_formula()
+            r["smiles"] = label_fragments(atoms, frags, smiles)[i]
             r["mult"] = sub.info["mult"]
             rows.append(r)
         out[side] = rows
@@ -275,6 +276,25 @@ def run_all(
             set_state(products, charge, mult)  # back to the system's state
         else:
             products = relax(products, calc)
+        pushed = []
+        if freq and m_r is not None:
+            # make every end molecule a true minimum before the band is run
+            for side, atoms, frags, mults in (("reactants", reactants, fr_r, m_r),
+                                              ("products", products, fr_p, m_p)):
+                names = label_fragments(atoms, frags, v["overall"][side])
+                for i, idx in enumerate(frags):
+                    sub = atoms[idx]
+                    set_state(sub, charge if len(frags) == 1 else 0,
+                              mult if len(frags) == 1 else mults[i])
+                    _, n = make_minimum(sub, calc, freq_threshold)
+                    if n:
+                        atoms.positions[idx] = _kabsch(sub.positions,
+                                                       atoms.positions[idx])[0]
+                        pushed.append(f"{names[i]} ({side[:-1]})")
+            if pushed and len(fr_r) > 1:
+                reactants = relax(reactants, calc)  # complex around the new shapes
+            set_state(reactants, charge, mult)
+            set_state(products, charge, mult)
         band_calc, env = calc, None
         if spin_envelope and m_r is not None and is_nse(calc):
             env = envelope_mults(m_r, m_p)
@@ -313,6 +333,7 @@ def run_all(
         if freq:
             freq_res = freq_report(images, E, fr_r, fr_p, m_r, m_p, charge, mult,
                                    calc, band_calc, v["overall"], freq_threshold)
+            freq_res["pushed_off_saddle"] = pushed
             bad = [f"{w} {x['smiles']} ({fmt_freq(x)})"
                    for w in ("reactants", "products") for x in freq_res[w]
                    if x["n_imag"]]
