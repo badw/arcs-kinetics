@@ -13,10 +13,48 @@ from ase.utils import forcecurve
 import tqdm
 
 from arcskin.check_endpoints import expected_bonds, geometry_bonds
+from arcskin.freq import check as freq_check, fmt as fmt_freq
 from arcskin.make_neb_endpoints import _kabsch
 from arcskin.spin import (DEFAULT_MODEL, SpinEnvelope, envelope_mults,
                           fragment_mults, fragments, get_calculator, is_nse,
                           set_state, system_mult)
+
+def freq_report(images, E, fr_r, fr_p, m_r, m_p, charge, mult, calc, band_calc,
+                overall, threshold=50.0):
+    """Frequencies of each reactant/product molecule (own spin state) and of
+    the band's highest interior image (band's own calculator)."""
+    out = {}
+    for side, atoms, frags, mults, smiles in (
+            ("reactants", images[0], fr_r, m_r, overall.get("reactants") or []),
+            ("products", images[-1], fr_p, m_p, overall.get("products") or [])):
+        rows = []
+        for i, idx in enumerate(frags):
+            sub = atoms[idx]
+            if len(frags) == 1:
+                set_state(sub, charge, mult)
+            else:
+                set_state(sub, 0, mults[i] if mults else None)
+            r = freq_check(sub, calc, threshold)
+            r["smiles"] = smiles[i] if len(smiles) == len(frags) else sub.get_chemical_formula()
+            r["mult"] = sub.info["mult"]
+            rows.append(r)
+        out[side] = rows
+    top = int(np.argmax(E))
+    if 0 < top < len(images) - 1:
+        ts = images[top].copy()
+        ts.info.update(images[top].info)
+        r = freq_check(ts, band_calc, threshold)
+        r["image"] = top
+        r["verdict"] = ("transition state" if r["n_imag"] == 1 else
+                        "no imaginary mode (not a saddle point)" if r["n_imag"] == 0
+                        else f"{r['n_imag']} imaginary modes (higher-order saddle "
+                             f"or unconverged band)")
+        out["ts"] = r
+    else:
+        out["ts"] = {"verdict": "no interior maximum (barrierless / monotonic)",
+                     "image": top, "n_imag": None, "imag": [], "freqs": []}
+    return out
+
 
 MIN_PATH = 0.5  # Å; shorter bands mean the endpoints are (nearly) the same structure
 
@@ -169,6 +207,7 @@ def determine_best(results):
             "spin_allowed": results[i].get("spin_allowed", True),
             "spin_envelope": results[i].get("spin_envelope"),
             "image_mults": results[i].get("image_mults"),
+            "freq": results[i].get("freq"),
         }
     ranking = pd.DataFrame(new_results).T.sort_values(by=["Ea", "dE"], ascending=True)
     return ranking
@@ -186,6 +225,8 @@ def run_all(
     model=None,
     separate_products=True,
     spin_envelope=True,
+    freq=False,
+    freq_threshold=50.0,
 ):
     """NEB every pathway in endpoints_dict.
 
@@ -197,7 +238,12 @@ def run_all(
     spin_envelope: when the two lowest total spins both sides can reach differ
     (radicals involved), run the band on the lower of the two at each image
     (see spin.SpinEnvelope); otherwise a bond breaking into two radicals is
-    forced onto the closed-shell singlet and its energy is far too high."""
+    forced onto the closed-shell singlet and its energy is far too high.
+    freq: also compute harmonic frequencies (arcskin.freq) of every reactant
+    and product molecule and of the highest image. A molecule with an
+    imaginary mode (|nu| > freq_threshold cm^-1) isn't a minimum, so the
+    pathway is marked not sane; the highest image should have exactly one
+    (a transition state), which is reported but doesn't change `sane`."""
     if not calculator:
         model = model or DEFAULT_MODEL
         print(f"running with {model}")
@@ -263,6 +309,17 @@ def run_all(
             reason = (reason + "; " if reason else "") + (
                 f"spin-forbidden: reactant spins {m_r} can't couple to the "
                 f"same total as product spins {m_p} (run at mult {mult})")
+        freq_res = None
+        if freq:
+            freq_res = freq_report(images, E, fr_r, fr_p, m_r, m_p, charge, mult,
+                                   calc, band_calc, v["overall"], freq_threshold)
+            bad = [f"{w} {x['smiles']} ({fmt_freq(x)})"
+                   for w in ("reactants", "products") for x in freq_res[w]
+                   if x["n_imag"]]
+            if bad:
+                sane = False
+                reason = (reason + "; " if reason else "") + (
+                    "not a minimum: " + ", ".join(bad))
         if kind == "barrierless" and "diff" in v["overall"]:
             # both NEB endpoints are the product, so the band's dE is 0 by
             # construction; use the isolated-species reaction energy instead
@@ -284,6 +341,7 @@ def run_all(
             "spin_allowed": spin_ok,
             "spin_envelope": env,
             "image_mults": image_mults,
+            "freq": freq_res,
         }
 
     results = determine_best(results)

@@ -39,6 +39,8 @@ import itertools
 import json
 import os
 import re
+import shutil
+import socket
 import sys
 import traceback
 
@@ -116,11 +118,15 @@ def add_compounds(db, key, smiles, role):
 
 def best_pathways(ranking, ea_tol):
     """Lowest-Ea pathway plus any within ea_tol (eV) of it (sane ones preferred)."""
-    sane = ranking[ranking["sane"].astype(bool)]
-    pool = sane if len(sane) else ranking
-    best = pool[pool["Ea"] <= pool["Ea"].min() + ea_tol]
     cols = ["pathway", "reactants", "products", "Ea", "dE", "diff", "sane", "kind",
             "reason"]
+    sane = ranking[ranking["sane"].astype(bool)]
+    if not len(sane):  # nothing sane: a weakly bound complex is the outcome
+        weak = weak_pick([row.to_dict() for _, row in ranking.iterrows()])
+        if weak is not None:
+            return [{c: weak.get(c) for c in cols}]
+    pool = sane if len(sane) else ranking
+    best = pool[pool["Ea"] <= pool["Ea"].min() + ea_tol]
     return [{c: row.get(c) for c in cols} for _, row in best.iterrows()]
 
 
@@ -232,6 +238,24 @@ def neb_pathways(args, db, key, paths):
     return new
 
 
+def freq_label(f):
+    """'min | min | TS 523i' summary of a NEB record's frequency check."""
+    if not f:
+        return "-"
+    from arcskin.freq import fmt
+
+    side = lambda rows: "min" if all(not x["n_imag"] for x in rows) else "; ".join(  # noqa: E731
+        f"{x['smiles']} {fmt(x)}" for x in rows if x["n_imag"])
+    ts = f.get("ts") or {}
+    if ts.get("n_imag") == 1:
+        t = f"TS {abs(ts['imag'][0]):.0f}i"
+    elif ts.get("n_imag") is None:
+        t = "no max"
+    else:
+        t = fmt(ts) if ts.get("n_imag") else "TS? 0 imag"
+    return f"{side(f.get('reactants') or [])} | {side(f.get('products') or [])} | {t}"
+
+
 def save_neb_bands(path, records):
     """Keep NEB images/energies/reaction coordinate in trajectories.json."""
     from arcskin.trajectories import save_neb
@@ -284,14 +308,19 @@ def neb_records(args, paths):
     log(f"running NEB on {len(endpoints)} pathway(s)")
     ranking = run_all(endpoints, n_images=args.n_images, climb=True, fmax=args.fmax,
                       model=args.model, separate_products=args.separate_products,
-                      spin_envelope=getattr(args, "spin_envelope", True))
+                      spin_envelope=getattr(args, "spin_envelope", True),
+                      freq=getattr(args, "freq", False))
     ranking = ranking.reset_index(names="pathway")
     new = ranking.to_dict("records")
+    freq = getattr(args, "freq", False)
     table([(r["pathway"], fmt_rxn(r["reactants"], r["products"]),
-            fnum(r["Ea"]), fnum(r["dE"]), r.get("mult"), bool(r["sane"]),
-            kind_label(r), r.get("reason") or "")
+            fnum(r["Ea"]), fnum(r["dE"]), r.get("mult"),
+            "weak" if weak_complex(r, WEAK_MAX) is not None else bool(r["sane"]),
+            kind_label(r)) + ((freq_label(r.get("freq")),) if freq else ())
+           + (weak_note(r) or r.get("reason") or "",)
            for _, r in ranking.sort_values("Ea").iterrows()],
-          ["#", "pathway", "Ea/eV", "dE/eV", "mult", "sane", "kind", "note"])
+          ["#", "pathway", "Ea/eV", "dE/eV", "mult", "sane", "kind"]
+          + (["freq R | P | TS"] if freq else []) + ["note"])
     return new
 
 
@@ -338,7 +367,8 @@ def run_pipeline(args, db, key, directory, suggest=True):
            if k not in ("smiles1", "smiles2", "db")], ["parameter", "value"])
 
     save(db, key, smiles=smiles, directory=directory, status="running",
-         settings=settings, model=args.model, log=os.path.join(directory, "arcskin.log"))
+         settings=settings, model=args.model, log=os.path.join(directory, "arcskin.log"),
+         pid=os.getpid(), host=socket.gethostname())
     add_compounds(db, key, smiles, "reactant")
 
     # 1. nanoreactor
@@ -427,6 +457,14 @@ def kind_label(r, weak_max=WEAK_MAX):
     if bind is not None:
         return f"weak complex ({bind:+.3f} eV)"
     return r.get("kind") or ""
+
+
+def weak_note(r, weak_max=WEAK_MAX):
+    """Explanation for a weak complex in NEB tables ('' if r isn't one)."""
+    bind = weak_complex(r, weak_max)
+    if bind is None:
+        return ""
+    return "no bonded minimum (falls apart); used as a pre-equilibrium"
 
 
 def weak_pick(records, weak_max=WEAK_MAX):
@@ -529,7 +567,7 @@ def print_suggestions(sugg):
 
 
 def cmd_run(args):
-    db = TinyDB(args.db)
+    db = open_db(args)
     key = reaction_key(args.smiles1, args.smiles2)
     entry = get_entry(db, key)
     if entry and entry_model(entry) != args.model:
@@ -560,31 +598,125 @@ def slug(text):
 
 
 def run_pair(args, db, key, directory, suggest=True):
-    """Run the pipeline for args.smiles1 + args.smiles2 with a log in `directory`."""
+    """Run the pipeline for args.smiles1 + args.smiles2 with a log in `directory`.
+
+    If the run dies (error or Ctrl-C) its partial xtb seed_*/ directories are
+    deleted, and a previously complete result (a --force rerun) is put back,
+    database entry and trajectories.json both."""
     os.makedirs(directory, exist_ok=True)
     logfile = os.path.join(directory, "arcskin.log")
     before = get_entry(db, key)
+    tj = os.path.join(directory, "trajectories.json")
+    backup = f"{tj}.previous"
+    if os.path.exists(tj):  # the nanoreactor will overwrite it
+        shutil.copy2(tj, backup)
     with run_log(logfile):
         try:
             run_pipeline(args, db, key, directory, suggest=suggest)
         except BaseException as e:  # incl. Ctrl-C
-            restore_or_fail(db, key, before, e)
+            restore_or_fail(db, key, before, e, directory,
+                            backup if os.path.exists(backup) else None,
+                            keep_xtb=getattr(args, "keep_xtb", False))
             raise
+        else:
+            if os.path.exists(backup):
+                os.remove(backup)
         finally:
             print(f"log written to {logfile}")
 
 
-def restore_or_fail(db, key, before, err):
-    """After a run dies: put back a previously complete entry (so a --force
-    rerun that is interrupted doesn't lose the old results), otherwise mark
-    the entry failed (so it isn't left at 'running' and skipped forever)."""
+def remove_seed_dirs(directory):
+    """Delete xtb seed_*/ directories of a pair directory; returns how many."""
+    n = 0
+    for name in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
+        path = os.path.join(directory, name)
+        if name.startswith("seed_") and os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+            n += 1
+    return n
+
+
+def restore_or_fail(db, key, before, err, directory=None, backup=None, keep_xtb=False):
+    """After a run dies: put back a previously complete entry and its
+    trajectories.json (so an interrupted --force rerun loses nothing),
+    otherwise mark the entry failed (so it isn't left at 'running' and
+    skipped forever); delete the partial xtb seed_*/ directories."""
+    why = "interrupted" if isinstance(err, KeyboardInterrupt) else str(err)
     if before and before.get("status") == "complete":
         db.remove(Query().key == key)
         db.insert(before)
-        print(f"run stopped ({type(err).__name__}); previous results restored")
+        if backup:
+            os.replace(backup, os.path.join(directory, "trajectories.json"))
+        print(f"run stopped ({why}); previous results restored")
     else:
-        why = "interrupted" if isinstance(err, KeyboardInterrupt) else err
         save(db, key, status=f"failed: {why}")
+        if backup:
+            os.remove(backup)
+        print(f"run stopped ({why}); marked failed (rerun with --retry-failed)")
+    if directory and not keep_xtb:
+        n = remove_seed_dirs(directory)
+        if n:
+            print(f"removed {n} partial xtb seed directory(ies) from {directory}")
+
+
+def _alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError, TypeError, ValueError):
+        return True  # exists (or can't tell): leave it alone
+    return True
+
+
+def recover_stale(db, quiet=False):
+    """Repair entries left at 'running' by a run that no longer exists (killed,
+    crashed, Ctrl-C before this was handled, ...). Runs on this machine are
+    checked by process id; entries from before ids were recorded count as
+    stale. An entry whose NEB covers every candidate pathway is marked
+    complete again; otherwise failed (rerun with --retry-failed or
+    `arcskin neb`). Leftover xtb seed_*/ directories are removed."""
+    here = socket.gethostname()
+    fixed = []
+    for e in db.search(Query().status == "running"):
+        if e.get("pid") is not None:
+            if e.get("host") not in (None, here) or _alive(e["pid"]):
+                continue  # still running, or on another machine
+        paths = {str(k) for k in (e.get("pathways") or {})}
+        done = {str(r.get("pathway")) for r in e.get("neb") or []}
+        done |= {str(d) for d in e.get("deferred") or []}
+        status = ("complete" if (paths and paths <= done) or
+                  (e.get("pathways") == {} and e.get("species_counts") is not None)
+                  else "failed: interrupted")
+        save(db, e["key"], status=status, pid=None)
+        n = remove_seed_dirs(e.get("directory") or "")
+        fixed.append((e["key"], f"-> {status}", n))
+    # finished runs with xtb directories still lying around (e.g. from an
+    # interrupted rerun), unless they were kept on purpose with --keep-xtb
+    for e in db.search(Query().status == "complete"):
+        d = e.get("directory") or ""
+        if (e.get("settings") or {}).get("keep_xtb") or not os.path.isdir(d):
+            continue
+        if not any(x.startswith("seed_") for x in os.listdir(d)):
+            continue
+        if not os.path.exists(os.path.join(d, "trajectories.json")):
+            continue  # the seeds may be the only copy of the MD
+        n = remove_seed_dirs(d)
+        if n:
+            fixed.append((e["key"], "complete", n))
+    if fixed and not quiet:
+        print("tidied up after run(s) that were interrupted or killed:")
+        for key, status, n in fixed:
+            print(f"  {key}: {status}"
+                  + (f"; removed {n} leftover xtb seed directory(ies)" if n else ""))
+    return fixed
+
+
+def open_db(args):
+    """The database, with stale 'running' entries repaired (recover_stale)."""
+    db = TinyDB(args.db)
+    recover_stale(db)
+    return db
 
 
 # --------------------------------------------------------------------------
@@ -688,8 +820,11 @@ def weak_complex(r, weak_max):
     return diff if np.isfinite(diff) and diff <= weak_max else None
 
 
+MAX_REACTANTS = None  # molecularity limit for network steps (None = any)
+
+
 def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None,
-              reverse=False):
+              reverse=False, max_reactants=MAX_REACTANTS):
     """Every NEB pathway in the database, each with `problem` set to why it
     can't be used ('' if it can).
 
@@ -763,6 +898,15 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None,
                         and x["Ea"] > max_ea):
                     x["problem"] = f"Ea > {max_ea}"
                 steps.append(x)
+    # elementary steps only: a 3-body step (e.g. the reverse of
+    # 2 NO2 -> 2 NO + O2, i.e. the overall reaction in one go) isn't a real
+    # collision; termolecular chemistry goes through weak-complex
+    # pre-equilibria (NO + O2 <=> ONOO, 2 NO <=> N2O2) instead
+    if max_reactants:
+        for st in steps:
+            n = len(st["reactants"])
+            if not st["problem"] and n > max_reactants:
+                st["problem"] = (f"{n} reactant molecules (--no-termolecular)")
     # one weak complex per pair run (see weak_pick); same pathway both ways
     chosen = {}
     for st in steps:
@@ -798,18 +942,20 @@ def all_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None,
 
 
 def reasonable_steps(db, max_ea, keep="best", ea_tol=0.1, model=None, weak_max=None,
-                     reverse=False):
+                     reverse=False, max_reactants=MAX_REACTANTS):
     """The NEB pathways a network search may use (see all_steps)."""
-    return [st for st in all_steps(db, max_ea, keep, ea_tol, model, weak_max, reverse)
+    return [st for st in all_steps(db, max_ea, keep, ea_tol, model, weak_max, reverse,
+                                   max_reactants)
             if not st["problem"]]
 
 
 def print_step_report(db, max_ea, states, name, keep="best", ea_tol=0.1, model=None,
-                      weak_max=None, reverse=False):
+                      weak_max=None, reverse=False, max_reactants=MAX_REACTANTS):
     """Why each step in the database was or wasn't usable."""
     reached = {k for sk in states for k, _ in sk}
     rows = []
-    for st in all_steps(db, max_ea, keep, ea_tol, model, weak_max, reverse):
+    for st in all_steps(db, max_ea, keep, ea_tol, model, weak_max, reverse,
+                        max_reactants):
         why = st["problem"]
         if not why:
             need = Counter(skeleton(x) for x in st["reactants"])
@@ -1226,7 +1372,7 @@ def run_decomposition(args, db, x, prod, sig, directory, console=None):
 
 def cmd_decompose(args):
     """NEB every one-bond split of each given species."""
-    db = TinyDB(args.db)
+    db = open_db(args)
     directory = args.dir or "."
     os.makedirs(directory, exist_ok=True)
     done = {(d["sig"], d.get("model")) for d in db.table("proposals").all()}
@@ -1287,7 +1433,7 @@ def print_mechanism(steps):
 
 
 def cmd_network(args):
-    db = TinyDB(args.db)
+    db = open_db(args)
     reactants, products = parse_reaction(args.reaction)
     targets = sorted(set(products) - set(reactants))
     overall = f"{' + '.join(reactants)} -> {' + '.join(products)}"
@@ -1299,6 +1445,7 @@ def cmd_network(args):
     networks, N = db.table("networks"), Query()
     use_model = None if args.any_model else args.model
     weak_max = None if args.weak_max < 0 else args.weak_max
+    max_reactants = 2 if args.no_termolecular else None
 
     # skeleton -> SMILES used to run/show a species: your reactants as written,
     # otherwise the nanoreactor's own spelling (so the analysis recognises it),
@@ -1346,7 +1493,8 @@ def cmd_network(args):
         while True:
             name = dict(base_name)
             steps = flask_steps(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol,
-                                                 use_model, weak_max, args.reverse), name)
+                                                 use_model, weak_max, args.reverse,
+                                                 max_reactants), name)
             for x in products:
                 name.setdefault(skeleton(x), x)
             states, truncated = explore(start, steps, args.max_states)
@@ -1387,7 +1535,8 @@ def cmd_network(args):
                 if args.reverse:  # product-side pair -> exactly the missing reactants
                     sigs = {x[3] for x in props}
                     props += [x for x in proposals(db, depth_b, start, name, args.model)
-                              if x[3] not in sigs]
+                              if x[3] not in sigs
+                              and not (args.no_termolecular and len(x[2]) > 2)]
                 if props:
                     banner(f"proposed steps from the overall equation: {len(props)}", "-")
                     for _, reac, prod, sig in props:
@@ -1509,7 +1658,7 @@ def cmd_network(args):
                     pargs.focus = tier_for(a, b)
                 pair_dir = os.path.join(directory, pair_dirname(key))
                 n_before = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model, weak_max,
-                                            args.reverse))
+                                            args.reverse, max_reactants))
                 try:
                     with contextlib.redirect_stdout(console):  # details -> pair log
                         run_pair(pargs, db, key, pair_dir, suggest=False)
@@ -1520,7 +1669,7 @@ def cmd_network(args):
                 log(f"done -> {pair_dir}/arcskin.log")
                 print_best(entry.get("best_pathways") or [])
                 new = len(reasonable_steps(db, args.max_ea, args.steps, args.ea_tol, use_model, weak_max,
-                                            args.reverse)) - n_before
+                                            args.reverse, max_reactants)) - n_before
                 log(f"{new} new usable step(s)")
             if stop:
                 break
@@ -1538,66 +1687,85 @@ def cmd_network(args):
             print("  try raising --max-ea / --max-runs / --scale, or --retry-failed")
             section("steps in the database")
             print_step_report(db, args.max_ea, states, name, args.steps, args.ea_tol,
-                              use_model, weak_max, args.reverse)
+                              use_model, weak_max, args.reverse, max_reactants)
             networks.upsert(jsanitize({"overall": overall, "status": "not found",
                                        "reachable": sorted(name.get(k, k) for k in reached),
                                        "updated": now()}),
                             N.overall == overall)
         else:
             sk, seq = route
-            grouped = []  # collapse repeated consecutive steps
-            for st in seq:
-                if grouped and grouped[-1][1] is st:
-                    grouped[-1][0] += 1
+            weak_used = any(st["kind"].startswith("weak") for st in seq)
+            main = report_route(
+                "mechanism (lowest barrier" + (", uses weak-complex pre-equilibria"
+                                              if weak_used else "") + ")",
+                seq, start, name)
+            record = {"overall": overall, "status": "found", "scale": args.scale,
+                      "mechanism": [dict(st, times=m) for m, st in main["grouped"]],
+                      "rate_limiting": main["rate_limiting"],
+                      "apparent_barrier": main["apparent_barrier"],
+                      "updated": now()}
+            if weak_used:
+                # the same search without weak complexes: every step a sane NEB
+                firm = [t for t in steps if not t[2]["kind"].startswith("weak")]
+                st2, _ = explore(start, firm, args.max_states)
+                d2 = [k for k in st2
+                      if all(dict(k).get(g, 0) >= v for g, v in goal.items())]
+                title = "mechanism using only sane NEB steps (no weak complexes)"
+                if d2:
+                    alt = report_route(title, route_to(st2, min(d2, key=lambda k: st2[k][0])),
+                                       start, name)
+                    record["mechanism_sane_only"] = [dict(st, times=m)
+                                                     for m, st in alt["grouped"]]
+                    record["apparent_barrier_sane_only"] = alt["apparent_barrier"]
+                    print(f"\n  compare: {main['apparent_barrier']:+.3f} eV with "
+                          f"pre-equilibria vs {alt['apparent_barrier']:+.3f} eV from "
+                          f"sane steps only")
                 else:
-                    grouped.append([1, st])
-            rls = max(seq, key=lambda st: st["Ea"])
-            section("mechanism")
-            print_mechanism(grouped)
-            flask = start
-            print("\n  flask:")
-            print(f"    start     : {fmt_flask(_fkey(flask), name)}")
-            for i, (m, st) in enumerate(grouped):
-                for _ in range(m):
-                    flask = (flask - Counter(skeleton(x) for x in st["reactants"])
-                             + Counter(skeleton(x) for x in st["products"]))
-                print(f"    after {i + 1:<3d} : {fmt_flask(_fkey(flask), name)}")
-            # energy profile: where each step starts (sum of earlier dE) and the
-            # highest point it reaches, relative to the starting flask
-            e_now, peak, peak_step = 0.0, 0.0, None
-            for i, (m, st) in enumerate(grouped):
-                for _ in range(m):
-                    top = e_now + st["Ea"]
-                    if top > peak or peak_step is None:
-                        peak, peak_step = max(peak, top), i + 1
-                    try:
-                        e_now += float(st["dE"])
-                    except (TypeError, ValueError):
-                        pass
-            if any(st["kind"] == "weak complex" for _, st in grouped):
-                print("\n  energy profile (relative to the start, sum of dE):")
-                e_now = 0.0
-                for i, (m, st) in enumerate(grouped):
-                    for _ in range(m):
-                        top = e_now + st["Ea"]
-                        try:
-                            e_now += float(st["dE"])
-                        except (TypeError, ValueError):
-                            pass
-                    print(f"    step {i + 1:<3d}: highest point {top:+.3f} eV, "
-                          f"then {e_now:+.3f} eV")
-                print(f"  apparent barrier   : {peak:+.3f} eV (step {peak_step}; "
-                      "includes uphill pre-equilibria)")
-            print(f"\n  rate-limiting step : {fmt_rxn(rls['reactants'], rls['products'])}"
-                  f"  (Ea = {rls['Ea']:.3f} eV)")
-            networks.upsert(jsanitize({"overall": overall, "status": "found",
-                                       "scale": args.scale,
-                                       "mechanism": [dict(st, times=m)
-                                                     for m, st in grouped],
-                                       "rate_limiting": rls, "updated": now()},
-                                      strict=False),
-                            N.overall == overall)
+                    section(title)
+                    print("  none with the steps found so far (weak complexes are "
+                          "needed); --best or more --max-runs may find one")
+            networks.upsert(jsanitize(record, strict=False), N.overall == overall)
         print(f"\nlog written to {logfile}")
+
+
+def report_route(title, seq, start, name):
+    """Print a mechanism (steps, flask contents, energy profile) and return
+    {"grouped", "rate_limiting", "apparent_barrier"}."""
+    grouped = []  # collapse repeated consecutive steps
+    for st in seq:
+        if grouped and grouped[-1][1] is st:
+            grouped[-1][0] += 1
+        else:
+            grouped.append([1, st])
+    rls = max(seq, key=lambda st: st["Ea"])
+    section(title)
+    print_mechanism(grouped)
+    flask = start
+    print("\n  flask:")
+    print(f"    start     : {fmt_flask(_fkey(flask), name)}")
+    for i, (m, st) in enumerate(grouped):
+        for _ in range(m):
+            flask = (flask - Counter(skeleton(x) for x in st["reactants"])
+                     + Counter(skeleton(x) for x in st["products"]))
+        print(f"    after {i + 1:<3d} : {fmt_flask(_fkey(flask), name)}")
+    # energy profile: where each step starts (sum of earlier dE) and the highest
+    # point it reaches, relative to the starting flask
+    print("\n  energy profile (relative to the start, sum of dE):")
+    e_now, peak, peak_step = 0.0, None, None
+    for i, (m, st) in enumerate(grouped):
+        for _ in range(m):
+            top = e_now + st["Ea"]
+            if peak is None or top > peak:
+                peak, peak_step = top, i + 1
+            try:
+                e_now += float(st["dE"])
+            except (TypeError, ValueError):
+                pass
+        print(f"    step {i + 1:<3d}: highest point {top:+.3f} eV, then {e_now:+.3f} eV")
+    print(f"  apparent barrier   : {peak:+.3f} eV (step {peak_step})")
+    print(f"  rate-limiting step : {fmt_rxn(rls['reactants'], rls['products'])}"
+          f"  (Ea = {rls['Ea']:.3f} eV)")
+    return {"grouped": grouped, "rate_limiting": rls, "apparent_barrier": peak}
 
 
 def read_smiles_list(args):
@@ -1653,7 +1821,7 @@ def batch_products(entries, known, max_ea=None, stable_only=False):
 
 
 def cmd_batch(args):
-    db = TinyDB(args.db)
+    db = open_db(args)
     species = read_smiles_list(args)
     if len(species) < (1 if args.self_pairs else 2):
         sys.exit("error: give at least two SMILES (or one with self pairs)")
@@ -1853,7 +2021,7 @@ def cmd_neb(args):
     analysis), or NEB A + B -> any products you give (e.g. a species the
     nanoreactor found). Results replace that pathway's old NEB, the best
     pathways are recomputed and the entry is marked complete."""
-    db = TinyDB(args.db)
+    db = open_db(args)
     key = reaction_key(args.smiles1, args.smiles2)
     entry = get_entry(db, key)
     if not entry or not (entry.get("pathways") or args.products):
@@ -1934,6 +2102,49 @@ def cmd_neb(args):
         print(f"\nlog written to {logfile}")
 
 
+def cmd_freq(args):
+    """Relax each species in its ground spin state and check it is a minimum."""
+    from ase.optimize import BFGS
+
+    from arcskin.check_endpoints import geometry_bonds
+    from arcskin.freq import check, fmt
+    from arcskin.make_neb_endpoints import embed
+    from arcskin.spin import fragments, get_calculator, ground_mult, set_state
+
+    calc = get_calculator(args.model)
+    for smi in args.smiles:
+        atoms, _ = embed(smi)
+        charge = int(atoms.info.get("charge", 0))
+        before = geometry_bonds(atoms)
+        mult = args.mult or ground_mult(atoms, calc, charge)
+        set_state(atoms, charge, mult)
+        atoms.calc = calc
+        BFGS(atoms, logfile=None).run(fmax=args.fmax, steps=1000)
+        after = geometry_bonds(atoms)
+        res = check(atoms, calc, args.threshold)
+        section(f"{smi}  (charge {charge}, mult {mult}, {args.model})")
+        print(f"  energy     : {atoms.get_potential_energy():.4f} eV")
+        if after != before:
+            sym = atoms.get_chemical_symbols()
+            lab = lambda bs: ", ".join(f"{sym[i]}{i}-{sym[j]}{j}" for i, j in sorted(bs))  # noqa: E731
+            n = len(fragments(len(atoms), after))
+            print(f"  bonding    : CHANGED on relaxation"
+                  + (f" (lost {lab(before - after)})" if before - after else "")
+                  + (f" (formed {lab(after - before)})" if after - before else "")
+                  + (f"; now {n} separate pieces" if n > 1 else ""))
+        else:
+            print("  bonding    : kept")
+        print(f"  verdict    : {'minimum' if not res['n_imag'] else fmt(res) + ' -> not a minimum'}"
+              + ("" if after == before else " (of the relaxed structure, not the SMILES)"))
+        print(f"  freqs/cm-1 : {' '.join(f'{x:.0f}' for x in res['freqs'])}")
+        if args.output:
+            from ase.io import write
+
+            out = args.output if len(args.smiles) == 1 else f"{slug(smi)}_{args.output}"
+            write(out, atoms)
+            print(f"  structure  -> {out}")
+
+
 def cmd_show(args):
     entry = get_entry(TinyDB(args.db), reaction_key(args.smiles1, args.smiles2))
     if not entry:
@@ -1983,6 +2194,11 @@ def main(argv=None):
         r.add_argument("--keep-xtb", action="store_true",
                        help="keep the xtb seed_*/ directories (by default they are "
                        "deleted once the MD frames are in trajectories.json)")
+        r.add_argument("--freq", action="store_true",
+                       help="frequency check on every NEB: each reactant/product "
+                       "molecule must have no imaginary mode (else not sane), and "
+                       "the highest image is checked for exactly one (a transition "
+                       "state). ~6N force calls per structure")
         r.add_argument("--ea-tol", type=float, default=0.1,
                        help="also suggest pathways with Ea within this of the best (eV)")
 
@@ -2016,6 +2232,11 @@ def main(argv=None):
     w.add_argument("--no-propose", dest="propose", action="store_false",
                    help="don't NEB steps suggested by the overall equation "
                    "(A + B -> exactly the missing products) before nanoreactor runs")
+    w.add_argument("--no-termolecular", action="store_true",
+                   help="only use uni- and bimolecular steps, so 3-body chemistry "
+                   "has to go through weak-complex pre-equilibria (by default "
+                   "steps with 3 reactants, e.g. the reverse of 2 NO2 -> 2 NO + "
+                   "O2, are allowed)")
     w.add_argument("--no-reverse", dest="reverse", action="store_false",
                    help="search forward only: don't use NEB steps backwards "
                    "(Ea_rev = Ea - dE) or run pairs from the product side "
@@ -2107,6 +2328,17 @@ def main(argv=None):
     nb.add_argument("--dir", help="where the pair directory is, if not recorded")
     run_options(nb)
     nb.set_defaults(func=cmd_neb)
+
+    fq = sub.add_parser("freq", help="relax species and check they are true minima "
+                        "(harmonic frequencies)")
+    fq.add_argument("smiles", nargs="+")
+    fq.add_argument("--model", default=DEFAULT_MODEL)
+    fq.add_argument("--mult", type=int, help="spin multiplicity (default: ground state)")
+    fq.add_argument("--fmax", type=float, default=0.01, help="relaxation fmax (eV/Å)")
+    fq.add_argument("--threshold", type=float, default=50.0,
+                    help="ignore imaginary modes softer than this (cm^-1)")
+    fq.add_argument("-o", "--output", help="write the relaxed structure (e.g. x.xyz)")
+    fq.set_defaults(func=cmd_freq)
 
     t = sub.add_parser("traj", help="list or export the MD / NEB trajectories "
                        "in a trajectories.json (for ASE)")
